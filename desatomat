@@ -716,11 +716,11 @@ def table_to_constexpr_cpp(table:Dict[str, List[List[List[Dict[str, desatomat_ty
         res = ""
         type_map = {desatomat_type.negitive_set:"neg_set", desatomat_type.positive_set:"set"}
         terminal_type_str = ""
-        if len(terminal['value']) == 1 and not terminal['type'] == desatomat_type.negitive_set:
+        if len(terminal.value) == 1 and not terminal.type == desatomat_type.negitive_set:
             terminal_type_str = "term"
         else:
-            terminal_type_str = type_map[terminal['type']]
-        res = f"using {terminal_name} = ctll::{terminal_type_str}<'{"', '".join(terminal['value'])}'>;"
+            terminal_type_str = type_map[terminal.type]
+        res = f"using {terminal_name} = ctll::{terminal_type_str}<'{"', '".join(terminal.value)}'>;"
         terminal_strings.append(res)
     rule_strings = []
     for rule_name, rule_content in table[desatomat_type.non_terminal].items():
@@ -970,12 +970,14 @@ def main():
 
     # Cannot use (pretty) print as it will take forever
     #logger.debug(identifier_graph)
-    """
+    
     logger.info("Converting table into cpp")
     
     constexpr_cpp = table_to_constexpr_cpp(identifier_table, args)
     
-    if os.path.exists(args.fname):
+
+    logger.debug(constexpr_cpp)
+    """if os.path.exists(args.fname):
         mode = 'w'
     else:
         mode = 'x'
