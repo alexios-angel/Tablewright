@@ -73,6 +73,14 @@ dash (``\\-``) is a literal. A ``^`` as the first character negates the range:
 a ``ctll::neg_set`` just like a named ``sigma -`` set. A ``^`` that is escaped
 (``\\^``) or not in first position is an ordinary literal.
 
+Wherever a single character can appear (an atom, a set member, a string-literal
+character, a range item), it may be spelled with an escape: the control escapes
+``\\n \\t \\r \\f \\v \\0 \\a \\b``, a hex escape ``\\xNN`` (exactly two hex
+digits) or ``\\u{H..H}`` (one to six hex digits, up to U+10FFFF), or a backslash
+before any other character for that literal character. Non-ASCII characters may
+also be typed directly; grammar files are read as UTF-8. A malformed hex escape
+keeps the old reading (``\\x`` is a literal ``x``).
+
 Rule bodies further support regex-style *grouping* and *repetition*. A
 parenthesized grouping ``(<expr> x)`` brackets a sequence of symbols (separated
 by commas or just whitespace), and the quantifiers ``+`` (one or more) and ``*``
@@ -278,7 +286,7 @@ def configure_logging(level, log_file=None):
     root.addHandler(console)
 
     if log_file:
-        file_handler = logging.FileHandler(log_file, mode="w")
+        file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
         file_handler.setLevel(level)
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
@@ -588,22 +596,76 @@ Grammar = Dict[object, "OrderedSet"]  # {nonterminal: OrderedSet[Production]}
 IdentifierTable = Dict[SymbolType, object]
 
 
+# The two hex escape forms: \xNN (exactly two hex digits) and \u{H..H} (one to
+# six hex digits in braces). Used both by the .gram lexer terminals below and by
+# the escape scanners here, so the two always agree on what is one token.
+HEX_ESCAPE_PATTERN = r"\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F]{1,6}\}"
+_HEX_ESCAPE_RE = re.compile(HEX_ESCAPE_PATTERN)
+
+
+def scan_escaped_tokens(text: str) -> list:
+    r"""Split ``text`` into per-character tokens, keeping escapes together.
+
+    Each token is a ``(token, was_escaped)`` pair where ``token`` is the raw
+    (still escaped) spelling of one character: a ``\xNN`` or ``\u{...}`` hex
+    escape, a two-character ``\c`` escape, or a single plain character. A
+    trailing lone backslash is a plain character, matching the historical
+    behaviour of the range tokenizer.
+
+    Args:
+        text: The raw text to scan (e.g. a string-literal body or a range body).
+
+    Returns:
+        The list of ``(token, was_escaped)`` pairs, in order.
+    """
+    tokens = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            match = _HEX_ESCAPE_RE.match(text, i)
+            if match:
+                tokens.append((match.group(), True))
+                i = match.end()
+                continue
+            if i + 1 < len(text):
+                tokens.append((text[i:i + 2], True))
+                i += 2
+                continue
+        tokens.append((text[i], False))
+        i += 1
+    return tokens
+
+
 def unescape_character(char: str) -> str:
     r"""
-    Turn a possibly backslash-escaped one- or two-character token into the single
-    character it denotes.
+    Turn a possibly backslash-escaped token into the single character it denotes.
 
     A bare character is returned unchanged. ``\n``, ``\t``, ``\r``, ``\f``,
     ``\v``, ``\0``, ``\a`` and ``\b`` map to their usual control characters;
-    a backslash before any other character (``\\``, ``\{``, ``\,`` ...) is an
-    escape for that literal character. (This replaces the original's
+    ``\xNN`` (exactly two hex digits) and ``\u{H..H}`` (one to six hex digits)
+    denote the character with that code point; a backslash before any other
+    character (``\\``, ``\{``, ``\,`` ...) is an escape for that literal
+    character. (The named escapes replace the original's
     ``decode('unicode-escape')``, which emitted a DeprecationWarning for escapes
     like ``\{`` that are not valid Python escapes.)
+
+    Raises:
+        ValueError: For a multi-character token that is not a recognized escape,
+            or a ``\u{...}`` code point beyond U+10FFFF.
     """
+    if char[0] != "\\":
+        if len(char) > 1:
+            raise ValueError("Character length greater than 2")
+        return char
+    if _HEX_ESCAPE_RE.fullmatch(char):
+        digits = char[3:-1] if char[1] == "u" else char[2:]
+        code_point = int(digits, 16)
+        if code_point > 0x10FFFF:
+            raise ValueError(
+                f"Escape {char!r} is beyond the last code point U+10FFFF")
+        return chr(code_point)
     if len(char) > 2:
         raise ValueError("Character length greater than 2")
-    if char[0] != "\\":
-        return char
     control = {
         r"\n": "\n", r"\t": "\t", r"\r": "\r", r"\f": "\f",
         r"\v": "\v", r"\0": "\0", r"\a": "\a", r"\b": "\b",
@@ -633,6 +695,7 @@ def expand_range_token(token: str) -> tuple:
         [[abcg-i]]     -> ({a, b, c, g, h, i}, False)
         [[a-zA-Z]]     -> ({a..z, A..Z}, False)
         [[0-9_]]       -> ({0..9, _}, False)
+        [[\x30-\x39]]  -> ({0..9}, False)      hex escapes work as endpoints
         [[^\nabc\r\0]] -> ({\n, a, b, c, \r, \0}, True)  i.e. none of these
 
     Args:
@@ -658,18 +721,11 @@ def expand_range_token(token: str) -> tuple:
             "Empty negated range '[[^]]' is not allowed" if negated
             else "Empty range '[[]]' is not allowed")
 
-    # Tokenize the body into characters, decoding backslash escapes, while
-    # remembering which characters came from an escape so an escaped '-' is never
-    # treated as a span separator.
-    items = []  # list of (char, was_escaped)
-    i = 0
-    while i < len(body):
-        if body[i] == "\\" and i + 1 < len(body):
-            items.append((unescape_character(body[i:i + 2]), True))
-            i += 2
-        else:
-            items.append((body[i], False))
-            i += 1
+    # Tokenize the body into characters, decoding backslash escapes (including
+    # \xNN / \u{...}), while remembering which characters came from an escape so
+    # an escaped '-' is never treated as a span separator.
+    items = [(unescape_character(token) if escaped else token, escaped)
+             for token, escaped in scan_escaped_tokens(body)]
 
     chars = set()
     index = 0
@@ -782,9 +838,13 @@ grammar = r"""
     QUANT: "+" | "*"
     # An atom inside a (grouping): any single character except unescaped
     # whitespace or the grouping's structural characters; escapes lift the
-    # restriction (e.g. \( \) \* \+ \, are the literal characters).
-    GATOM: /\\.|[^\s,()<>\[\]|"*+@]/
-    ATOM: /\\?[^\s]/
+    # restriction (e.g. \( \) \* \+ \, are the literal characters). The hex
+    # escapes \xNN and \u{H..H} come first so they match as one token.
+    GATOM: /\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F]{1,6}\}|\\.|[^\s,()<>\[\]|"*+@]/
+    # A rule-body / set-member atom: one possibly escaped character. The hex
+    # escapes \xNN (two digits) and \u{H..H} (1-6 digits) denote a code point;
+    # a malformed hex escape falls back to the old reading (\x is a literal x).
+    ATOM: /\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F]{1,6}\}|\\?[^\s]/
     SPACES: /[ \t\f]+/
     WHITESPACES: /\s+/ 
     %ignore WHITESPACES
@@ -820,6 +880,14 @@ Rules
   |          separates alternatives
   ,          separates the symbols of one alternative
   epsilon    (or '@') the empty production
+
+Escapes (atoms, set members, strings, ranges)
+---------------------------------------------
+  \\n \\t \\r \\f \\v \\0 \\a \\b    the usual control characters
+  \\xNN                       code point NN (exactly two hex digits)
+  \\u{H..H}                   code point (1-6 hex digits, up to U+10FFFF)
+  \\c                         any other escaped character is that literal
+  Non-ASCII characters may also be typed directly (files are read as UTF-8).
 
 Repetition and grouping
 -----------------------
@@ -863,8 +931,8 @@ _TOKEN_DESCRIPTIONS = {
     "VBAR": "'|'",
     "NAME": "a terminal/nonterminal name",
     "SINGLE_NAME": "a name",
-    "ATOM": "a character",
-    "GATOM": "a character",
+    "ATOM": "a character (a plain char, \\c, \\xNN or \\u{...})",
+    "GATOM": "a character (a plain char, \\c, \\xNN or \\u{...})",
     "QUANT": "'+' or '*'",
     "STAR": "'*'",
     "PLUS": "'+'",
@@ -1342,13 +1410,17 @@ def break_strings(table: IdentifierTable) -> None:
             for item_index, item in list(enumerate(rule)):
                 if item.is_string():
                     text = item.value
+                    # Decode escapes (\n, \", \xNN, \u{...}) so each atom is the
+                    # character it denotes, not the raw escape spelling.
+                    characters = [unescape_character(token) if escaped else token
+                                  for token, escaped in scan_escaped_tokens(text)]
                     rule_list = list(nonterminals[name])[rule_index]
                     rule_list.pop(item_index)
-                    for character in reversed(text):
+                    for character in reversed(characters):
                         rule_list.insert(item_index, GrammerType(character, SymbolType.atom))
                     expansions += 1
                     trace(f"break string: \"{text}\" in '{name}' -> "
-                          f"{len(text)} atom(s)")
+                          f"{len(characters)} atom(s)")
     if expansions:
         logger.debug(f"Expanded {expansions} string literal(s) into atoms")
 
@@ -3957,6 +4029,88 @@ class RangeExpansionTests(unittest.TestCase):
         self.assertEqual(body[0].value, {"b", "c"})
 
 
+class HexEscapeTests(unittest.TestCase):
+    r"""Tests for the ``\xNN`` / ``\u{...}`` hex escapes and raw Unicode."""
+
+    def test_unescape_hex_forms(self):
+        r"""``\xNN`` and ``\u{H..H}`` decode to their code points."""
+        self.assertEqual(unescape_character(r"\x41"), "A")
+        self.assertEqual(unescape_character(r"\x0a"), "\n")
+        self.assertEqual(unescape_character(r"\u{41}"), "A")
+        self.assertEqual(unescape_character(r"\u{20AC}"), "\u20ac")
+        self.assertEqual(unescape_character(r"\u{1F600}"), "\U0001f600")
+        self.assertEqual(unescape_character(r"\u{0}"), "\0")
+
+    def test_unescape_rejects_out_of_range(self):
+        """A code point beyond U+10FFFF is rejected with a clear error."""
+        with self.assertRaises(ValueError):
+            unescape_character(r"\u{110000}")
+
+    def test_scanner_keeps_escapes_together(self):
+        """The escape scanner yields hex escapes as single tokens."""
+        self.assertEqual(scan_escaped_tokens(r"a\x41\u{42}\nc"),
+                         [("a", False), (r"\x41", True), (r"\u{42}", True),
+                          (r"\n", True), ("c", False)])
+        # A trailing lone backslash stays a plain character (historical).
+        self.assertEqual(scan_escaped_tokens("a\\"), [("a", False), ("\\", False)])
+
+    def test_hex_atom_in_rule(self):
+        r"""``\x41`` in a rule body is the single atom 'A'."""
+        cpp = _generate_cpp("St->\\x41,<St>|epsilon\n")
+        self.assertIn("ctll::term<'A'>", cpp)
+
+    def test_unicode_escape_atom_emits_char32(self):
+        r"""A ``\u{...}`` beyond one byte is emitted as a char32_t literal."""
+        cpp = _generate_cpp("St->\\u{20AC},<St>|epsilon\n")
+        self.assertIn("ctll::term<U'\\x20AC'>", cpp)
+
+    def test_hex_in_set_definition(self):
+        """Hex escapes work as set members."""
+        table = _build_identifier_table(
+            "tok={\\x61,\\u{7A}}\nSt->tok,<St>|epsilon\n")
+        self.assertEqual(table[SymbolType.terminal]["tok"].value, {"a", "z"})
+
+    def test_hex_in_string_literal(self):
+        """Escapes inside a string decode when the string breaks into atoms."""
+        cpp = _generate_cpp('St->"\\x42\\u{43}d",<St>|epsilon\n')
+        for term in ("ctll::term<'B'>", "ctll::term<'C'>", "ctll::term<'d'>"):
+            self.assertIn(term, cpp)
+
+    def test_escaped_quote_in_string_literal(self):
+        r"""``\"`` inside a string is the quote character, not backslash+quote."""
+        table = _build_identifier_table('St->"a\\"b"\n')
+        break_strings(table)
+        body = next(iter(table[SymbolType.non_terminal]["St"]))
+        self.assertEqual([s.value for s in body], ["a", '"', "b"])
+
+    def test_hex_in_range(self):
+        r"""Hex escapes work as ``[[...]]`` span endpoints."""
+        self.assertEqual(expand_range_token(r"[[\x30-\x39]]"),
+                         (set("0123456789"), False))
+        self.assertEqual(expand_range_token(r"[[^\u{0}-\u{1F}]]")[1], True)
+
+    def test_hex_in_group(self):
+        r"""A hex escape is one GATOM inside a grouping."""
+        table = _build_identifier_table("St->a,(\\x28)+,b\n")
+        rules = table[SymbolType.non_terminal]
+        helper = next(n for n in rules if n.endswith("_anon"))
+        body = next(iter(rules[helper]))
+        self.assertEqual(body[0].value, "(")
+
+    def test_malformed_hex_keeps_old_reading(self):
+        r"""``\x`` without two hex digits is still the literal 'x'."""
+        self.assertEqual(unescape_character(r"\x"), "x")
+        cpp = _generate_cpp("St->\\x,g\n")  # \x is the atom 'x'
+        self.assertIn("ctll::term<'x'>", cpp)
+
+    def test_raw_unicode_end_to_end(self):
+        """Raw non-ASCII characters flow through atoms, sets and ranges."""
+        cpp = _generate_cpp("euro={\u20ac}\nSt->\u00e9,[[\u03b1-\u03b3]],euro,<St>|epsilon\n")
+        self.assertIn("U'\\x20AC'", cpp)
+        self.assertIn("'\\xE9'", cpp)
+        self.assertIn("ctll::set<U'\\x3B1',U'\\x3B2',U'\\x3B3'>", cpp)
+
+
 class SetDefinitionSyntaxTests(unittest.TestCase):
     """Tests for the ``:`` assignment operator and optional ``{}`` around sets."""
 
@@ -4403,7 +4557,7 @@ def build_test_suite() -> "unittest.TestSuite":
     for case in (GrammerTypeTests, CharLiteralTests, IdentifierSafetyTests,
                  TerminalAliaserTests, FirstFollowTests, ParseTableTests,
                  GrammarAnalysisTests, OptimizationTests, IntegrationTests,
-                 RangeExpansionTests, SetDefinitionSyntaxTests,
+                 RangeExpansionTests, HexEscapeTests, SetDefinitionSyntaxTests,
                  RuleOperatorSyntaxTests, QuantifierGroupTests,
                  RangeLookaheadTests,
                  QualityOfLifeTests, RegressionTests):
@@ -4688,7 +4842,7 @@ def parse_args() -> argparse.Namespace:
                              "one wide ctll::set, cutting compile-time character "
                              "comparisons on large classes")
 
-    parser.add_argument("--input", type=argparse.FileType("r"),
+    parser.add_argument("--input", type=argparse.FileType("r", encoding="utf-8"),
                         action=ValidateFileExistsAction,
                         help='Input file path or "-" for stdin')
     parser.add_argument("--output", type=Path, default=".",
@@ -4810,7 +4964,7 @@ def write_debug_json(path, table: IdentifierTable, args) -> None:
         "terminal_aliases": aliases,
         "analysis": analysis_json,
     }
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(document, f, indent=2, sort_keys=True)
 
 
@@ -4870,7 +5024,7 @@ def main() -> None:
         """Write an intermediate stage to the dump directory, if enabled."""
         if dump_dir is not None:
             path = Path(dump_dir) / filename
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(text + "\n")
             logger.debug(f"  wrote {path}")
 
@@ -4985,7 +5139,7 @@ def main() -> None:
     # Write to <output dir>/<fname>, or to --output directly if it is a file.
     output_dir = Path(args.output)
     out_path = output_dir / args.fname if output_dir.is_dir() else output_dir
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(constexpr_cpp)
     logger.info(f"Wrote generated grammar to {out_path} "
                 f"({len(constexpr_cpp)} bytes)")
