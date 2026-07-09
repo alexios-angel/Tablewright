@@ -1558,24 +1558,19 @@ def compute_follow(grammar: Grammar, first: Dict[GrammerType, set]) -> Dict[Gram
                 for i, symbol in enumerate(production):
                     if not symbol.is_non_terminal():
                         continue
-                    # Look at what can follow this nonterminal within the rule,
-                    # skipping transparent semantic actions.
-                    j = i + 1
-                    while j < len(production) and production[j].is_semantic_action():
-                        j += 1
-                    if j >= len(production):
-                        # Nothing after it: it inherits FOLLOW(non_terminal).
-                        if follow[non_terminal] - follow[symbol]:
-                            follow[symbol] |= follow[non_terminal]
-                            updated = True
-                        continue
-                    nxt = production[j]
-                    next_first = first[nxt] if nxt.is_non_terminal() else {nxt}
-                    if next_first - {EPSILON} - follow[symbol]:
-                        follow[symbol] |= next_first - {EPSILON}
+                    # For A -> alpha B beta, FOLLOW(B) gains FIRST(beta) - {eps},
+                    # where beta is the *entire* remainder of the production (not
+                    # just the next symbol -- a nullable symbol in the middle must
+                    # not hide the symbols after it). first_of_sequence already
+                    # skips transparent semantic actions and returns {EPSILON} for
+                    # an empty remainder.
+                    rest_first = first_of_sequence(production[i + 1:], first)
+                    if rest_first - {EPSILON} - follow[symbol]:
+                        follow[symbol] |= rest_first - {EPSILON}
                         updated = True
-                    # If what follows is nullable, FOLLOW(non_terminal) flows in too.
-                    if EPSILON in next_first and (follow[non_terminal] - follow[symbol]):
+                    # Only if the whole remainder is nullable (or empty) does
+                    # FOLLOW(non_terminal) flow into FOLLOW(B).
+                    if EPSILON in rest_first and (follow[non_terminal] - follow[symbol]):
                         follow[symbol] |= follow[non_terminal]
                         updated = True
         if not updated:
