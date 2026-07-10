@@ -229,7 +229,7 @@ from io import TextIOWrapper
 from pathlib import Path
 from pprint import pformat
 from sys import stdout
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 # Lark parses the .gram input.
 from lark import Discard, Lark, Token, Transformer, Tree, Visitor
@@ -1999,7 +1999,8 @@ def first_of_sequence(production, first: Dict[GrammerType, set]) -> set:
 def construct_parse_table(grammar: Grammar,
                           first: Dict[GrammerType, set],
                           follow: Dict[GrammerType, set],
-                          strict: bool = False) -> Dict[GrammerType, dict]:
+                          strict: bool = False,
+                          kinds_out: Optional[dict] = None) -> Dict[GrammerType, dict]:
     """Build the (q)LL(1) parse table.
 
     For each production, every terminal in its FIRST maps to it (a "shift"); if
@@ -2089,6 +2090,9 @@ def construct_parse_table(grammar: Grammar,
         f"Parse table built: {cells} cells across {len(parse_table)} nonterminals"
         + (f", {coexistences} Q-grammar shift/epsilon resolutions" if coexistences else "")
     )
+    if kinds_out is not None:
+        for non_terminal, row in fill_kind.items():
+            kinds_out[non_terminal] = dict(row)
     return parse_table
 
 
@@ -3168,7 +3172,7 @@ def render_production_rhs(production, terminal_table: dict, aliaser=None) -> str
 
 
 def build_parse_table_for_output(table: IdentifierTable, optimization_level: int = 0,
-                                 q_grammar: bool = True):
+                                 q_grammar: bool = True, kinds_out: Optional[dict] = None):
     """Prepare the grammar and build its parse table for rendering.
 
     Normalizes keys, inlines pure character-class helpers, applies the requested
@@ -3199,7 +3203,8 @@ def build_parse_table_for_output(table: IdentifierTable, optimization_level: int
     logger.debug(stringify_first_follow(first, "FIRST"))
     follow = compute_follow(grammar, first)
     logger.debug(stringify_first_follow(follow, "FOLLOW"))
-    parse_table = construct_parse_table(grammar, first, follow, strict=not q_grammar)
+    parse_table = construct_parse_table(grammar, first, follow, strict=not q_grammar,
+                                        kinds_out=kinds_out)
     logger.debug(stringify_parse_table(parse_table))
     return grammar, parse_table, follow
 
@@ -3277,7 +3282,8 @@ def explain_nonterminal(name: str, table: IdentifierTable,
 
 
 def _emit_rules_for_nonterminal(nonterminal, entries: dict, terminal_table: dict,
-                                indentation: str, aliaser=None) -> str:
+                                indentation: str, aliaser=None,
+                                kinds: Optional[dict] = None) -> str:
     """Render all ``rule`` overloads for one nonterminal as a block of lines.
 
     Lookaheads selecting the *same* production are merged into a single overload
@@ -3300,16 +3306,19 @@ def _emit_rules_for_nonterminal(nonterminal, entries: dict, terminal_table: dict
         The newline-joined block of ``rule`` overloads.
     """
     order = []                # rhs strings, in first-seen order
-    group_chars = {}          # rhs -> set of concrete lookahead chars
+    group_chars = {}          # rhs -> set of shift-claimed lookahead chars
+    group_eps_chars = {}      # rhs -> chars reached via an epsilon fallback cell
     group_has_others = {}     # rhs -> bool   (global 'other' -> _others)
     group_has_eoi = {}        # rhs -> bool   ('$' -> ctll::epsilon)
     group_neg_sets = {}       # rhs -> list of negative-set char tuples
+    shift_char_owner = {}     # char -> rhs of the shift production claiming it
 
     for lookahead, production in entries.items():
         rhs = render_production_rhs(production, terminal_table, aliaser)
         if rhs not in group_chars:
             order.append(rhs)
             group_chars[rhs] = set()
+            group_eps_chars[rhs] = set()
             group_has_others[rhs] = False
             group_has_eoi[rhs] = False
             group_neg_sets[rhs] = []
@@ -3338,7 +3347,32 @@ def _emit_rules_for_nonterminal(nonterminal, entries: dict, terminal_table: dict
                 if entry not in group_neg_sets[rhs]:
                     group_neg_sets[rhs].append(entry)
         else:
-            group_chars[rhs].update(resolved.value)
+            # The Q-grammar shift/epsilon preference is decided per terminal
+            # SYMBOL, but two different named sets can share characters. Track
+            # which characters are claimed by consuming ("shift") cells so
+            # epsilon-fallback rows can be emitted without them; a character
+            # claimed by two different shift productions is a real ambiguity
+            # the symbol-level check cannot see.
+            kind = kinds.get(lookahead) if kinds is not None else None
+            if kind == "epsilon":
+                group_eps_chars[rhs].update(resolved.value)
+            else:
+                for char in resolved.value:
+                    owner = shift_char_owner.get(char)
+                    if owner is not None and owner != rhs:
+                        raise ValueError(
+                            f"Grammar is not (q)LL(1): in nonterminal "
+                            f"'{nonterminal}', lookahead character {char!r} is "
+                            f"claimed by two different consuming productions "
+                            f"(via overlapping terminal sets)"
+                        )
+                    shift_char_owner[char] = rhs
+                group_chars[rhs].update(resolved.value)
+
+    # Characters consumed by a shift cell shadow the same characters in any
+    # epsilon-fallback cell of this state (Q-grammar: shift wins).
+    for rhs in order:
+        group_chars[rhs] |= group_eps_chars[rhs] - set(shift_char_owner)
 
     def lookahead_token(type_string, chars, is_neg, gram_name=None):
         """Return the alias (if aliasing) or the inline type for a lookahead."""
@@ -3390,8 +3424,9 @@ def table_to_constexpr_cpp(table: IdentifierTable, args: argparse.Namespace) -> 
     terminal_table = table[SymbolType.terminal]
 
     q_grammar = getattr(args, "q_grammar", True)
+    cell_kinds: dict = {}
     grammar, parse_table, _follow = build_parse_table_for_output(
-        table, getattr(args, "optimization", 0), q_grammar
+        table, getattr(args, "optimization", 0), q_grammar, kinds_out=cell_kinds
     )
 
     # Nonterminal forward declarations (sorted; start symbol gets _start alias).
@@ -3427,7 +3462,8 @@ def table_to_constexpr_cpp(table: IdentifierTable, args: argparse.Namespace) -> 
     # The (q)LL1 rule overloads, in the grammar's own declaration order. Rendering
     # populates the aliaser with every terminal the rules reference.
     rule_blocks = [
-        _emit_rules_for_nonterminal(nt, parse_table[nt], terminal_table, indentation, aliaser)
+        _emit_rules_for_nonterminal(nt, parse_table[nt], terminal_table, indentation, aliaser,
+                                    kinds=cell_kinds.get(nt))
         for nt in grammar.keys()
         if parse_table.get(nt)
     ]
