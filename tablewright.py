@@ -234,7 +234,7 @@ from typing import Dict, List, Optional, Sequence, Set
 from lark import Discard, Lark, Token, Transformer, Tree, Visitor
 from lark.exceptions import UnexpectedInput
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 AUTHORS = [
     {"name": "Alexios Angel", "email": "aangeletakis@gmail.com"},
 ]
@@ -750,6 +750,513 @@ def expand_range_token(token: str) -> tuple:
 
 
 # ======================================================================== #
+# A small regex engine: Lark regexes parsed into grammar ASTs
+# ======================================================================== #
+
+# Tablewright's own regular-expression parser. The Lark frontend meets
+# regexes inside terminal definitions (``WORD: /[a-z]+/``) and inline in
+# rules; translating them into EDS -- which knows atoms, ``[[...]]``
+# character sets, ``"strings"``, ``+``/``*`` repetition and ``|``
+# alternation -- requires understanding the pattern structurally, not
+# textually. This parser produces the same ``("seq" / "alt" / "quant" /
+# "charset")`` node language the external frontends lower, so a parsed
+# pattern drops straight into the EDS emitter.
+#
+# Only the language-defining subset is accepted. Constructs that select
+# match *positions* rather than characters -- anchors, word boundaries,
+# lookarounds, backreferences -- have no counterpart in a context-free
+# rule and are rejected with a pointed error instead of being silently
+# mistranslated. Greedy/lazy markers are accepted and ignored (they change
+# which match is *preferred*, never which strings are *matched*), while
+# possessive quantifiers are rejected (they do change the language).
+
+_REGEX_DIGIT_CHARS = frozenset("0123456789")
+_REGEX_WORD_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_REGEX_SPACE_CHARS = frozenset(" \t\r\n\f\v")
+_REGEX_CONTROL_ESCAPES = {
+    "n": "\n", "t": "\t", "r": "\r", "f": "\f", "v": "\v", "a": "\a", "0": "\0",
+}
+
+
+class RegexSyntaxError(ValueError):
+    """A regular expression that cannot be parsed or translated to a grammar."""
+
+    def __init__(self, pattern: str, position: int, message: str):
+        caret = " " * position + "^"
+        super().__init__(f"{message}\n  /{pattern}/\n   {caret}")
+        self.pattern = pattern
+        self.position = position
+
+
+def _fold_case(chars) -> set:
+    """Return ``chars`` with the upper- and lowercase form of every member."""
+    folded = set()
+    for char in chars:
+        folded.add(char)
+        folded.update(char.lower())
+        folded.update(char.upper())
+    return folded
+
+
+def _repeat_node(node, minimum: int, maximum):
+    """Expand a counted repetition into plain sequence/option/star nodes.
+
+    ``X{2,4}`` becomes ``X X (X (X)?)?`` -- the mandatory copies followed by a
+    right-nested chain of optionals -- and ``X{2,}`` becomes ``X X X*``. The
+    result recognizes exactly the counted language using only the constructs
+    EDS can express.
+
+    Args:
+        node: The repeated AST node.
+        minimum: The minimum number of copies.
+        maximum: The maximum number of copies, or ``None`` for unbounded.
+
+    Returns:
+        The expanded AST node.
+    """
+    copies = [node] * minimum
+    if maximum is None:
+        copies.append(("quant", node, "*"))
+    else:
+        optional = None
+        for _ in range(maximum - minimum):
+            inner = node if optional is None else ("seq", [node, optional])
+            optional = ("quant", inner, "?")
+        if optional is not None:
+            copies.append(optional)
+    if not copies:
+        return ("seq", [])
+    if len(copies) == 1:
+        return copies[0]
+    return ("seq", copies)
+
+
+class _RegexParser:
+    """Recursive-descent parser for the supported regex subset."""
+
+    # The largest counted repetition worth expanding into copies. Grammars
+    # with genuinely huge counts would explode the rule set; refuse early.
+    MAX_COUNTED_REPEAT = 512
+
+    def __init__(self, pattern: str, flags: str = ""):
+        for flag in flags:
+            if flag not in "imsxlu":
+                raise RegexSyntaxError(pattern, 0,
+                                       f"unknown regex flag {flag!r}")
+        if "l" in flags:
+            raise RegexSyntaxError(
+                pattern, 0, "the locale flag /l has no compile-time meaning")
+        self.ignorecase = "i" in flags
+        self.dotall = "s" in flags
+        # 'm' only changes anchors and anchors are rejected anyway; 'u' is
+        # the default text semantics. Both are accepted as no-ops.
+        self.pattern = self._strip_verbose(pattern) if "x" in flags else pattern
+        self.pos = 0
+
+    @staticmethod
+    def _strip_verbose(pattern: str) -> str:
+        """Apply the /x flag: drop unescaped whitespace and # comments."""
+        out = []
+        in_class = False
+        index = 0
+        while index < len(pattern):
+            char = pattern[index]
+            if char == "\\" and index + 1 < len(pattern):
+                out.append(pattern[index:index + 2])
+                index += 2
+                continue
+            if in_class:
+                out.append(char)
+                in_class = char != "]"
+                index += 1
+                continue
+            if char == "[":
+                in_class = True
+                out.append(char)
+                index += 1
+                continue
+            if char == "#":
+                while index < len(pattern) and pattern[index] != "\n":
+                    index += 1
+                continue
+            if char in " \t\n\r\f\v":
+                index += 1
+                continue
+            out.append(char)
+            index += 1
+        return "".join(out)
+
+    def _error(self, message: str, position: int = None) -> RegexSyntaxError:
+        where = self.pos if position is None else position
+        return RegexSyntaxError(self.pattern, where, message)
+
+    def _peek(self):
+        return self.pattern[self.pos] if self.pos < len(self.pattern) else None
+
+    def parse(self):
+        node = self._alternation()
+        if self.pos != len(self.pattern):
+            raise self._error("unbalanced ')'")
+        return node
+
+    def _alternation(self):
+        branches = [self._sequence()]
+        while self._peek() == "|":
+            self.pos += 1
+            branches.append(self._sequence())
+        return branches[0] if len(branches) == 1 else ("alt", branches)
+
+    def _sequence(self):
+        items = []
+        while self._peek() not in (None, "|", ")"):
+            items.append(self._term())
+        if len(items) == 1:
+            return items[0]
+        return ("seq", items)
+
+    def _term(self):
+        node = self._factor()
+        quantified = self._apply_quantifier(node)
+        if quantified is not node and self._peek() in ("*", "+", "?", "{"):
+            # a*+ / a*? was consumed above; a** or a*{2} is either an error
+            # or a possessive form -- both change nothing we could express
+            if self._peek() != "{" or self._counted_repeat_ahead():
+                raise self._error("stacked quantifiers are not supported "
+                                  "(group the inner repetition instead)")
+        return quantified
+
+    def _counted_repeat_ahead(self) -> bool:
+        """Whether the text at ``pos`` is a well-formed ``{n}``/``{n,m}``."""
+        return re.match(r"\{\d+(,\d*)?\}", self.pattern[self.pos:]) is not None
+
+    def _apply_quantifier(self, node):
+        char = self._peek()
+        if char in ("*", "+", "?"):
+            self.pos += 1
+            self._consume_repeat_mode()
+            return ("quant", node, char)
+        if char == "{" and self._counted_repeat_ahead():
+            start = self.pos
+            match = re.match(r"\{(\d+)(?:,(\d*))?\}", self.pattern[self.pos:])
+            minimum = int(match.group(1))
+            if match.group(2) is None:
+                maximum = minimum
+            else:
+                maximum = int(match.group(2)) if match.group(2) else None
+            if maximum is not None and maximum < minimum:
+                raise self._error("bad repeat interval: max is below min", start)
+            if max(minimum, maximum or 0) > self.MAX_COUNTED_REPEAT:
+                raise self._error(
+                    f"counted repetition beyond {self.MAX_COUNTED_REPEAT} "
+                    "would explode the grammar", start)
+            self.pos += match.end()
+            self._consume_repeat_mode()
+            return _repeat_node(node, minimum, maximum)
+        return node
+
+    def _consume_repeat_mode(self):
+        """Accept a lazy '?' (same language); reject a possessive '+'."""
+        if self._peek() == "?":
+            self.pos += 1
+        elif self._peek() == "+":
+            raise self._error("possessive quantifiers change the matched "
+                              "language and are not supported")
+
+    def _factor(self):
+        char = self._peek()
+        if char == "(":
+            return self._group()
+        if char == "[":
+            return self._char_class()
+        if char == ".":
+            self.pos += 1
+            if self.dotall:
+                # truly any character: the complement of nothing has no EDS
+                # spelling, so say "anything but newline, or a newline"
+                return ("alt", [("charset", frozenset("\n"), True),
+                                ("charset", frozenset("\n"), False)])
+            return ("charset", frozenset("\n"), True)
+        if char in "^$":
+            raise self._error(
+                f"the anchor '{char}' has no meaning in a grammar rule; "
+                "remove it (grammar symbols already match whole tokens)")
+        if char in "*+?":
+            raise self._error("nothing for the quantifier to repeat")
+        if char == "\\":
+            return self._escape_node()
+        self.pos += 1
+        return self._char_node(char)
+
+    def _char_node(self, char: str):
+        chars = _fold_case({char}) if self.ignorecase else {char}
+        return ("charset", frozenset(chars), False)
+
+    def _group(self):
+        opening = self.pos
+        self.pos += 1  # '('
+        if self._peek() == "?":
+            self.pos += 1
+            marker = self._peek()
+            if marker == ":":
+                self.pos += 1
+            elif marker == "P":
+                self.pos += 1
+                if self._peek() == "<":  # (?P<name>...) is just a group
+                    while self._peek() not in (None, ">"):
+                        self.pos += 1
+                    if self._peek() != ">":
+                        raise self._error("unterminated group name", opening)
+                    self.pos += 1
+                else:  # (?P=name) backreference
+                    raise self._error(
+                        "backreferences are not regular and cannot become "
+                        "grammar rules", opening)
+            elif marker == "#":  # (?#comment)
+                while self._peek() not in (None, ")"):
+                    self.pos += 1
+                if self._peek() != ")":
+                    raise self._error("unterminated (?#...) comment", opening)
+                self.pos += 1
+                return ("seq", [])
+            elif marker in ("=", "!") or (marker == "<" and
+                                          self.pattern[self.pos + 1:self.pos + 2]
+                                          in ("=", "!")):
+                raise self._error(
+                    "lookarounds cannot be translated to a grammar", opening)
+            else:
+                raise self._error(
+                    "unsupported (?...) group (inline flags, conditionals "
+                    "and lookarounds are not translatable)", opening)
+        body = self._alternation()
+        if self._peek() != ")":
+            raise self._error("unbalanced '('", opening)
+        self.pos += 1
+        return body
+
+    def _escape_node(self):
+        kind, payload = self._escape(in_class=False)
+        if kind == "set":
+            chars, negated = payload
+            if self.ignorecase:
+                chars = frozenset(_fold_case(chars))
+            return ("charset", frozenset(chars), negated)
+        return self._char_node(payload)
+
+    def _escape(self, in_class: bool):
+        r"""Read one ``\`` escape; return ``("char", c)`` or ``("set", (chars, neg))``."""
+        start = self.pos
+        self.pos += 1  # the backslash
+        char = self._peek()
+        if char is None:
+            raise self._error("dangling backslash", start)
+        self.pos += 1
+        if char == "d":
+            return ("set", (_REGEX_DIGIT_CHARS, False))
+        if char == "D":
+            return ("set", (_REGEX_DIGIT_CHARS, True))
+        if char == "w":
+            return ("set", (_REGEX_WORD_CHARS, False))
+        if char == "W":
+            return ("set", (_REGEX_WORD_CHARS, True))
+        if char == "s":
+            return ("set", (_REGEX_SPACE_CHARS, False))
+        if char == "S":
+            return ("set", (_REGEX_SPACE_CHARS, True))
+        if char in _REGEX_CONTROL_ESCAPES:
+            return ("char", _REGEX_CONTROL_ESCAPES[char])
+        if char == "b":
+            if in_class:
+                return ("char", "\x08")
+            raise self._error(
+                r"the word boundary \b has no meaning in a grammar rule", start)
+        if char in "BAZ":
+            raise self._error(
+                f"the anchor \\{char} has no meaning in a grammar rule", start)
+        if char == "N":
+            raise self._error(r"named escapes \N{...} are not supported", start)
+        if char in "xuU":
+            width = {"x": 2, "u": 4, "U": 8}[char]
+            digits = self.pattern[self.pos:self.pos + width]
+            if len(digits) != width or not all(
+                    d in "0123456789abcdefABCDEF" for d in digits):
+                raise self._error(
+                    f"\\{char} needs exactly {width} hex digits", start)
+            self.pos += width
+            code_point = int(digits, 16)
+            if code_point > 0x10FFFF:
+                raise self._error(
+                    f"\\U{digits} is beyond the last code point U+10FFFF", start)
+            return ("char", chr(code_point))
+        if char.isdigit():
+            raise self._error(
+                "backreferences are not regular and cannot become grammar "
+                "rules", start)
+        return ("char", char)
+
+    def _char_class(self):
+        opening = self.pos
+        self.pos += 1  # '['
+        negated = False
+        if self._peek() == "^":
+            negated = True
+            self.pos += 1
+        chars = set()
+        first = True
+        while True:
+            char = self._peek()
+            if char is None:
+                raise self._error("unterminated character class", opening)
+            if char == "]" and not first:
+                self.pos += 1
+                break
+            first = False
+            item = self._class_item(opening)
+            # a '-' between two single characters is a span
+            if (isinstance(item, str) and self._peek() == "-"
+                    and self.pattern[self.pos + 1:self.pos + 2] not in ("", "]")):
+                dash_at = self.pos
+                self.pos += 1
+                end_item = self._class_item(opening)
+                if not isinstance(end_item, str):
+                    raise self._error(
+                        "a class shorthand cannot end a range", dash_at)
+                if ord(item) > ord(end_item):
+                    raise self._error(
+                        f"range start {item!r} is after end {end_item!r}",
+                        dash_at)
+                chars.update(chr(code) for code in
+                             range(ord(item), ord(end_item) + 1))
+            elif isinstance(item, str):
+                chars.add(item)
+            else:
+                chars.update(item)
+        if not chars:
+            raise self._error("empty character class", opening)
+        if self.ignorecase:
+            chars = _fold_case(chars)
+        return ("charset", frozenset(chars), negated)
+
+    def _class_item(self, opening: int):
+        """One class element: a character (str) or a shorthand's char set."""
+        char = self._peek()
+        if char == "\\":
+            kind, payload = self._escape(in_class=True)
+            if kind == "set":
+                chars, negated = payload
+                if negated:
+                    raise self._error(
+                        "a negated shorthand inside [...] is not supported; "
+                        "rewrite the class explicitly", opening)
+                return chars
+            return payload
+        self.pos += 1
+        return char
+
+
+def parse_regex(pattern: str, flags: str = ""):
+    r"""Parse a regular expression into the frontend grammar AST.
+
+    The supported subset is the language-defining core of Python/Lark
+    regexes: literals, ``.``, character classes (ranges, negation, the
+    ``\d \w \s`` shorthands), ``\xNN``/``\uNNNN``/``\UNNNNNNNN`` escapes,
+    grouping (plain, non-capturing and named), alternation, the ``? * +``
+    quantifiers and counted ``{n}``/``{n,}``/``{n,m}`` repetition, plus the
+    ``i``, ``s`` and ``x`` flags. Anchors, word boundaries, lookarounds,
+    backreferences, possessive quantifiers and inline flags are rejected
+    with a :class:`RegexSyntaxError` explaining why.
+
+    Args:
+        pattern: The pattern text (without the surrounding slashes).
+        flags: Trailing flag letters (as in ``/.../ims``).
+
+    Returns:
+        An AST in the frontend node language: ``("seq", [...])``,
+        ``("alt", [...])``, ``("quant", node, op)`` and
+        ``("charset", frozenset, negated)``.
+
+    Raises:
+        RegexSyntaxError: For syntax errors and untranslatable constructs.
+    """
+    return _RegexParser(pattern, flags).parse()
+
+
+# ======================================================================== #
+# EDS emission: stringify frontend ASTs back into the .gram dialect
+# ======================================================================== #
+
+# Characters that must be escaped when emitted as a rule-body atom or a set
+# member: the structural syntax of the .gram dialect plus the comment mark.
+_EDS_STRUCTURAL_CHARS = frozenset(',(){}<>[]|"*+@\\#')
+# Structural characters of a [[...]] range body.
+_EDS_RANGE_STRUCTURAL_CHARS = frozenset("]^-\\")
+_EDS_NAMED_ESCAPES = {
+    "\n": r"\n", "\t": r"\t", "\r": r"\r", "\f": r"\f",
+    "\v": r"\v", "\0": r"\0", "\a": r"\a", "\b": r"\b",
+}
+# Names with a fixed meaning somewhere in the EDS pipeline: 'epsilon' and
+# 'empty'/'sigma' in the dialect itself, 'other' as the auto-computed
+# catch-all terminal.
+_EDS_RESERVED_NAMES = frozenset({"epsilon", "empty", "sigma", "other"})
+_EDS_NAME_RE = re.compile(r"[a-zA-Z][a-zA-Z_0-9]+")
+
+
+def _eds_escape_char(char: str, structural=_EDS_STRUCTURAL_CHARS) -> str:
+    """Spell one character safely for an EDS atom / set member / range body."""
+    if char in _EDS_NAMED_ESCAPES:
+        return _EDS_NAMED_ESCAPES[char]
+    code = ord(char)
+    if code < 0x20 or code == 0x7F:
+        return f"\\x{code:02x}"
+    if code > 0x7E:
+        return f"\\u{{{code:x}}}"
+    if char == " ":
+        # '\ ' would not lex (ATOM never spans whitespace); spell the code point
+        return r"\x20"
+    if char in structural:
+        return "\\" + char
+    return char
+
+
+def _eds_string(text: str) -> str:
+    """Spell ``text`` as an EDS ``"..."`` string literal."""
+    parts = []
+    for char in text:
+        if char == '"':
+            parts.append('\\"')
+        elif char == "\\":
+            parts.append("\\\\")
+        elif char in _EDS_NAMED_ESCAPES:
+            parts.append(_EDS_NAMED_ESCAPES[char])
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            parts.append(f"\\x{ord(char):02x}")
+        elif ord(char) > 0x7E:
+            parts.append(f"\\u{{{ord(char):x}}}")
+        else:
+            parts.append(char)
+    return '"' + "".join(parts) + '"'
+
+
+def _eds_range_token(chars, negated: bool) -> str:
+    """Spell a character set as an EDS ``[[...]]`` / ``[[^...]]`` range."""
+    ranges, residual = decompose_into_runs(chars, min_range_len=3)
+    items = [(lo, f"{_eds_escape_char(lo, _EDS_RANGE_STRUCTURAL_CHARS)}-"
+                  f"{_eds_escape_char(hi, _EDS_RANGE_STRUCTURAL_CHARS)}")
+             for lo, hi in ranges]
+    items += [(char, _eds_escape_char(char, _EDS_RANGE_STRUCTURAL_CHARS))
+              for char in residual]
+    body = "".join(spelling for _, spelling in sorted(items, key=lambda i: ord(i[0][0])))
+    return f"[[^{body}]]" if negated else f"[[{body}]]"
+
+
+def _eds_charset_token(chars, negated: bool) -> str:
+    """Spell a charset as the shortest applicable EDS symbol."""
+    if not negated and len(chars) == 1:
+        return _eds_escape_char(next(iter(chars)))
+    return _eds_range_token(chars, negated)
+
+
+# ======================================================================== #
 # The .gram input grammar (parsed by Lark) and its tree transforms
 # ======================================================================== #
 
@@ -1127,62 +1634,165 @@ def _parse_external_expression(source: str):
     return ExternalExpressionTransformer().transform(tree)
 
 
-def _quote_eds_literal(token: str) -> str:
-    body = token[1:-1]
-    if token[0] == "'":
-        body = body.replace(r'\"', '"').replace('"', r'\"')
-    return f'"{body}"'
+def _decode_quoted_literal(token: str) -> "tuple[str, bool]":
+    r"""Decode a quoted Lark/EBNF string literal into its character content.
+
+    Handles both quote styles, the Lark ``"..."i`` case-insensitive suffix,
+    and Python-style escapes (``\n``-family, ``\xNN``, ``\uNNNN``,
+    ``\UNNNNNNNN``; any other escaped character is itself).
+
+    Args:
+        token: The literal as it appears in the source, quotes included.
+
+    Returns:
+        An ``(text, insensitive)`` pair.
+    """
+    insensitive = token.endswith("i") and token[0] in "\"'"
+    body_token = token[:-1] if insensitive else token
+    body = body_token[1:-1]
+    out = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            escape = body[index + 1]
+            if escape in _REGEX_CONTROL_ESCAPES:
+                out.append(_REGEX_CONTROL_ESCAPES[escape])
+                index += 2
+                continue
+            if escape == "b":
+                out.append("\x08")
+                index += 2
+                continue
+            if escape in "xuU":
+                width = {"x": 2, "u": 4, "U": 8}[escape]
+                digits = body[index + 2:index + 2 + width]
+                if len(digits) == width and all(
+                        d in "0123456789abcdefABCDEF" for d in digits):
+                    code_point = int(digits, 16)
+                    if code_point > 0x10FFFF:
+                        raise ValueError(
+                            f"escape \\{escape}{digits} in {token} is beyond "
+                            "the last code point U+10FFFF")
+                    out.append(chr(code_point))
+                    index += 2 + width
+                    continue
+            out.append(escape)
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out), insensitive
 
 
-def _external_rules_to_eds(rules: list[tuple[str, object]]) -> str:
-    """Lower parsed external grammar expressions into the native EDS syntax."""
-    nonterminals = {name for name, _ in rules}
-    generated = []
-    counter = 0
+def _split_regex_literal(token: str) -> "tuple[str, str]":
+    """Split a ``/pattern/flags`` literal into its pattern and flag letters."""
+    pattern, _, flags = token[1:].rpartition("/")
+    return pattern, flags
 
-    def helper(node, suffix: str) -> str:
-        nonlocal counter
-        counter += 1
-        name = f"tw_{suffix}_{counter}"
-        alternatives = emit_alternatives(node)
-        generated.append(f"{name} -> {' | '.join(alternatives)}")
-        nonterminals.add(name)
+
+class _EdsEmitter:
+    """Stringify frontend grammar ASTs into the native EDS dialect.
+
+    This is the shared back half of every external frontend: the EBNF and
+    Lark readers produce ASTs in one small node language -- ``("name", n)``,
+    ``("literal", tok)``, ``("literal_range", lo, hi)``, ``("charset",
+    chars, negated)``, ``("seq", [...])``, ``("alt", [...])`` and
+    ``("quant", node, op)`` -- and this class serializes those ASTs to
+    ``.gram`` text, inventing ``tw_*`` helper nonterminals for the shapes
+    EDS cannot spell inline (alternation groups and ``?`` optionality).
+    Regex literals are parsed with :func:`parse_regex` and their ASTs are
+    emitted through the same path.
+    """
+
+    def __init__(self, nonterminals=(), terminal_names=()):
+        self.nonterminals = set(nonterminals)
+        self.terminal_names = set(terminal_names)
+        self.generated = []
+        self.counter = 0
+
+    def helper(self, node, suffix: str) -> str:
+        """Emit ``node`` as a fresh helper nonterminal and return its name."""
+        self.counter += 1
+        name = f"tw_{suffix}_{self.counter}"
+        alternatives = self.emit_alternatives(node)
+        self.generated.append(f"{name} -> {' | '.join(alternatives)}")
+        self.nonterminals.add(name)
         return name
 
-    def emit_item(node) -> list[str]:
+    def emit_item(self, node) -> list:
+        """Serialize one AST node into a list of EDS rule-body tokens."""
         kind = node[0]
         if kind == "name":
             name = node[1]
             if name in {"epsilon", "empty"}:
                 return ["epsilon"]
-            return [f"<{name}>" if name in nonterminals else name]
+            return [f"<{name}>" if name in self.nonterminals else name]
         if kind == "literal":
-            return [_quote_eds_literal(node[1])]
+            return self._emit_literal(node[1])
+        if kind == "literal_range":
+            low, _ = _decode_quoted_literal(node[1])
+            high, _ = _decode_quoted_literal(node[2])
+            if len(low) != 1 or len(high) != 1:
+                raise ValueError(
+                    f"the range {node[1]}..{node[2]} needs single-character "
+                    "endpoints")
+            chars = frozenset(chr(code)
+                              for code in range(ord(low), ord(high) + 1))
+            return [_eds_charset_token(chars, False)]
+        if kind == "charset":
+            return [_eds_charset_token(node[1], node[2])]
         if kind in {"seq", "alt"}:
-            return [f"<{helper(node, 'group')}>"]
+            return [f"<{self.helper(node, 'group')}>"]
         if kind == "quant":
             base, quantifier = node[1], node[2]
-            base_name = helper(base, "repeat")
             if quantifier == "?":
-                optional_name = helper(("alt", [("seq", [("name", base_name)]),
-                                                   ("seq", [])]), "optional")
-                return [f"<{optional_name}>"]
-            return [f"<{base_name}>{quantifier}"]
+                optional = self.helper(("alt", [base, ("seq", [])]), "optional")
+                return [f"<{optional}>"]
+            tokens = self.emit_item(base)
+            if len(tokens) == 1 and tokens[0] != "epsilon":
+                # every single token is a valid quant_base: an atom, a
+                # "string", a [[range]], a bare terminal or a <nonterminal>
+                return [tokens[0] + quantifier]
+            repeated = self.helper(base, "repeat")
+            return [f"<{repeated}>{quantifier}"]
         raise ValueError(f"unsupported expression node {kind!r}")
 
-    def emit_alternatives(node) -> list[str]:
-        if node[0] == "alt":
-            return [emit_sequence(branch) for branch in node[1]]
-        return [emit_sequence(node)]
+    def _emit_literal(self, token: str) -> list:
+        if token.startswith("/"):
+            pattern, flags = _split_regex_literal(token)
+            return self.emit_item(parse_regex(pattern, flags))
+        text, insensitive = _decode_quoted_literal(token)
+        if not text:
+            return ["epsilon"]
+        if insensitive:
+            return [_eds_charset_token(frozenset(_fold_case({char})), False)
+                    for char in text]
+        if len(text) == 1:
+            return [_eds_escape_char(text)]
+        return [_eds_string(text)]
 
-    def emit_sequence(node) -> str:
+    def emit_alternatives(self, node) -> list:
+        if node[0] == "alt":
+            return [self.emit_sequence(branch) for branch in node[1]]
+        return [self.emit_sequence(node)]
+
+    def emit_sequence(self, node) -> str:
         items = node[1] if node[0] == "seq" else [node]
-        emitted = [symbol for item in items for symbol in emit_item(item)]
+        emitted = [token for item in items for token in self.emit_item(item)]
         return ", ".join(emitted) if emitted else "epsilon"
 
-    output = [f"{name} -> {' | '.join(emit_alternatives(node))}" for name, node in rules]
-    output.extend(generated)
-    return "\n".join(output) + "\n"
+    def stringify_rules(self, rules) -> list:
+        """Serialize ``(name, ast)`` rules plus any helpers they spawned."""
+        lines = [f"{name} -> {' | '.join(self.emit_alternatives(node))}"
+                 for name, node in rules]
+        return lines + self.generated
+
+
+def _external_rules_to_eds(rules: "list[tuple[str, object]]") -> str:
+    """Lower parsed external grammar expressions into the native EDS syntax."""
+    emitter = _EdsEmitter(nonterminals={name for name, _ in rules})
+    return "\n".join(emitter.stringify_rules(rules)) + "\n"
 
 
 def ebnf_to_eds(source: str) -> str:
@@ -1222,7 +1832,13 @@ class LarkGrammarTransformer(Transformer):
         operator = str(values[1])
         if operator in {"?", "*", "+"}:
             return ("quant", node, operator)
-        raise ValueError("Lark repetition ranges (~ n or ~ n..m) are not supported")
+        # a counted repetition: expr ~ n or expr ~ n..m
+        minimum = int(operator)
+        maximum = int(str(values[2])) if len(values) > 2 else minimum
+        if maximum < minimum:
+            raise ValueError(
+                f"Lark repetition ~ {minimum}..{maximum} has max below min")
+        return _repeat_node(node, minimum, maximum)
 
     def expansion(self, children):
         return ("seq", list(children))
@@ -1247,7 +1863,8 @@ class LarkGrammarTransformer(Transformer):
 
     @staticmethod
     def _definition(children, kind: str):
-        name = str(children[0])
+        # a leading '?' or '!' only shapes Lark's parse tree; strip it
+        name = str(children[0]).lstrip("?!")
         expression = next(
             (child for child in reversed(children)
              if isinstance(child, tuple)),
@@ -1271,7 +1888,7 @@ class LarkGrammarTransformer(Transformer):
         return children[0]
 
     def ignore(self, _children):
-        return Discard
+        return ("directive", "ignore")
 
     def import_(self, _children):
         return Discard
@@ -1282,8 +1899,10 @@ class LarkGrammarTransformer(Transformer):
     def multi_import(self, _children):
         return Discard
 
-    def declare(self, _children):
-        return Discard
+    def declare(self, children):
+        names = [child[1] for child in children
+                 if isinstance(child, tuple) and child[0] == "name"]
+        return ("declare", names)
 
     def priority(self, _children):
         return None
@@ -1292,65 +1911,206 @@ class LarkGrammarTransformer(Transformer):
         return [child for child in children if child is not None]
 
 
-def _lark_terminal_characters(name: str, node) -> set[str]:
-    """Resolve a Lark terminal AST that denotes a set of single characters."""
-    branches = node[1] if node[0] == "alt" else [node]
-    characters = set()
-    for branch in branches:
-        items = branch[1] if branch[0] == "seq" else [branch]
-        if len(items) != 1:
-            raise ValueError(f"Lark terminal {name} must match exactly one character")
-        item = items[0]
-        if item[0] == "literal_range":
-            lo = unescape_character(item[1][1:-1])
-            hi = unescape_character(item[2][1:-1])
-            characters.update(chr(code) for code in range(ord(lo), ord(hi) + 1))
-            continue
-        if item[0] != "literal":
-            raise ValueError(f"Lark terminal {name} must be a literal or character class")
-        literal = item[1]
-        if literal.startswith("/"):
-            match = re.fullmatch(r"/\[([^]]+)\]/[imslux]*", literal)
-            single = re.fullmatch(r"/(\\?.)/[imslux]*", literal)
-            if match:
-                chars, _ = expand_range_token(f"[[{match.group(1)}]]")
-                characters.update(chars)
-            elif single:
-                characters.add(unescape_character(single.group(1)))
-            else:
-                raise ValueError(
-                    f"Lark terminal {name} must use a one-character regex or character class")
-        else:
-            suffix = "i" if literal.endswith('"i') else ""
-            quoted = literal[:-1] if suffix else literal
-            chars = scan_escaped_tokens(quoted[1:-1])
-            if len(chars) != 1:
-                raise ValueError(f"Lark terminal {name} must match exactly one character")
-            char = unescape_character(chars[0][0])
-            characters.update({char.lower(), char.upper()} if suffix else {char})
-    return characters
+def _reduce_to_charset(node, terminal_asts: dict, visiting: set):
+    """Reduce a terminal AST to one character set, or ``None`` if it isn't one.
+
+    A terminal whose whole language is "exactly one character out of this
+    set" can stay a *terminal* in EDS (a set definition); anything with
+    structure -- repetition, multi-character sequences -- must become a rule.
+    References to other terminals are followed (cycles bail out to ``None``
+    and are reported later as ordinary rule-level errors).
+    """
+    kind = node[0] if isinstance(node, tuple) else None
+    if kind == "charset":
+        return node
+    if kind == "literal":
+        token = node[1]
+        if token.startswith("/"):
+            pattern, flags = _split_regex_literal(token)
+            return _reduce_to_charset(parse_regex(pattern, flags),
+                                      terminal_asts, visiting)
+        text, insensitive = _decode_quoted_literal(token)
+        if len(text) != 1:
+            return None
+        chars = _fold_case({text}) if insensitive else {text}
+        return ("charset", frozenset(chars), False)
+    if kind == "literal_range":
+        low, _ = _decode_quoted_literal(node[1])
+        high, _ = _decode_quoted_literal(node[2])
+        if len(low) != 1 or len(high) != 1 or ord(low) > ord(high):
+            return None
+        return ("charset",
+                frozenset(chr(code) for code in range(ord(low), ord(high) + 1)),
+                False)
+    if kind == "name":
+        name = node[1]
+        if name in visiting or name not in terminal_asts:
+            return None
+        visiting.add(name)
+        try:
+            return _reduce_to_charset(terminal_asts[name], terminal_asts,
+                                      visiting)
+        finally:
+            visiting.discard(name)
+    if kind == "seq":
+        return (_reduce_to_charset(node[1][0], terminal_asts, visiting)
+                if len(node[1]) == 1 else None)
+    if kind == "alt":
+        parts = [_reduce_to_charset(branch, terminal_asts, visiting)
+                 for branch in node[1]]
+        if any(part is None for part in parts):
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        if any(part[2] for part in parts):
+            return None  # a union with a complement is no longer one set
+        union = frozenset().union(*(part[1] for part in parts))
+        return ("charset", union, False)
+    return None
+
+
+def _allocate_eds_names(names) -> dict:
+    """Map every Lark rule/terminal name onto a legal, unique EDS name.
+
+    EDS references require ``[a-zA-Z][a-zA-Z_0-9]+`` (two or more characters,
+    no leading underscore) and a few names are reserved by the dialect and
+    the pipeline; anything unusable keeps its spelling behind a ``tw_``
+    prefix.
+    """
+    mapping = {}
+    used = set(_EDS_RESERVED_NAMES)
+    for name in names:
+        candidate = name
+        if not _EDS_NAME_RE.fullmatch(candidate) or candidate in used:
+            candidate = f"tw_{name}"
+            serial = 2
+            while candidate in used or not _EDS_NAME_RE.fullmatch(candidate):
+                candidate = f"tw_{name}_{serial}"
+                serial += 1
+        mapping[name] = candidate
+        used.add(candidate)
+    return mapping
+
+
+def _rename_ast(node, mapping: dict):
+    """Apply a name mapping across a frontend AST."""
+    kind = node[0]
+    if kind == "name":
+        return ("name", mapping.get(node[1], node[1]))
+    if kind in {"seq", "alt"}:
+        return (kind, [_rename_ast(child, mapping) for child in node[1]])
+    if kind == "quant":
+        return ("quant", _rename_ast(node[1], mapping), node[2])
+    return node
+
+
+def _collect_referenced_names(node, into: set):
+    """Collect every ``("name", ...)`` reference in a frontend AST."""
+    kind = node[0]
+    if kind == "name":
+        into.add(node[1])
+    elif kind in {"seq", "alt"}:
+        for child in node[1]:
+            _collect_referenced_names(child, into)
+    elif kind == "quant":
+        _collect_referenced_names(node[1], into)
 
 
 def lark_to_eds(source: str) -> str:
-    """Parse official Lark syntax with Lark and lower character grammars to EDS."""
+    """Convert a Lark grammar document into Tablewright's native EDS syntax.
+
+    Parser rules become EDS rules. A terminal whose language is one
+    character out of a set (``DIGIT: /[0-9]/``, ``SIGN: "+" | "-"``) stays a
+    terminal -- an EDS set definition -- while any multi-character terminal
+    (``WORD: /[a-z]+/``, ``ARROW: "->"``) is lowered into EDS *rules*, its
+    regexes translated by Tablewright's own regex parser. This means such
+    tokens are recognized character by character *by the grammar itself*:
+    CTLL has no separate lexer, so there is no longest-match tokenization --
+    where a real lexer would disambiguate overlapping tokens, the grammar
+    must be (q)LL(1) at the character level, and conflicts surface when the
+    parse table is built. ``%ignore`` declarations are parsed but cannot be
+    honored (there is no token stream to filter); a warning says so.
+    """
     try:
         tree = _LARK_GRAMMAR_PARSER.parse(source)
     except UnexpectedInput as exc:
         raise ValueError(format_grammar_syntax_error(exc, source, "<lark>")) from exc
     records = LarkGrammarTransformer().transform(tree)
     definitions = [record for record in records
-                   if isinstance(record, tuple) and len(record) == 3]
+                   if isinstance(record, tuple) and len(record) == 3
+                   and record[0] in {"rule", "token"}]
+    declared = {name for record in records
+                if isinstance(record, tuple) and record[0] == "declare"
+                for name in record[1]}
+    if any(isinstance(record, tuple) and record == ("directive", "ignore")
+           for record in records):
+        logger.warning(
+            "%%ignore is parsed but not applied: CTLL grammars read "
+            "characters directly (there is no token stream to filter), so "
+            "weave optional whitespace into the rules instead")
     parser_rules = [(name, expression) for kind, name, expression in definitions
                     if kind == "rule"]
     terminals = [(name, expression) for kind, name, expression in definitions
                  if kind == "token"]
     if not parser_rules:
         raise ValueError("Lark grammar contains no parser rules")
-    eds_terminals = []
+
+    # Undefined references are Lark-level errors; report them with Lark
+    # terminology before any renaming muddies the water.
+    defined = {name for name, _ in parser_rules} | {name for name, _ in terminals}
+    referenced = set()
+    for _, expression in parser_rules + terminals:
+        _collect_referenced_names(expression, referenced)
+    missing = sorted(referenced - defined)
+    undeclared = [name for name in missing if name not in declared]
+    if undeclared:
+        raise ValueError(
+            "Lark grammar references undefined names: " + ", ".join(undeclared))
+    used_declared = sorted(set(missing) & declared)
+    if used_declared:
+        raise ValueError(
+            "%declare terminals have no definition to translate (CTLL has no "
+            "external lexer): " + ", ".join(used_declared))
+
+    # Decide which terminals can stay EDS terminal sets. The rest become
+    # rules, recognized character by character.
+    terminal_asts = dict(terminals)
+    set_terminals = {}
+    rule_terminals = []
     for name, expression in terminals:
-        chars = _lark_terminal_characters(name, expression)
-        eds_terminals.append(f"{name} = {{{', '.join(sorted(chars, key=ord))}}}")
-    return "\n".join(eds_terminals) + "\n" + _external_rules_to_eds(parser_rules)
+        charset = _reduce_to_charset(expression, terminal_asts, {name})
+        if charset is not None:
+            set_terminals[name] = charset
+        else:
+            rule_terminals.append((name, expression))
+
+    # The EDS start symbol is the first rule emitted; honor Lark's 'start'
+    # convention when present.
+    ordered_rules = sorted(parser_rules,
+                           key=lambda rule: rule[0] != "start")
+
+    rename = _allocate_eds_names(
+        [name for name, _ in ordered_rules]
+        + [name for name, _ in rule_terminals]
+        + list(set_terminals))
+    nonterminal_names = ({rename[name] for name, _ in ordered_rules}
+                         | {rename[name] for name, _ in rule_terminals})
+    set_names = {rename[name] for name in set_terminals}
+
+    lines = []
+    for name, charset in set_terminals.items():
+        members = ", ".join(_eds_escape_char(char)
+                            for char in sorted(charset[1], key=ord))
+        if charset[2]:
+            lines.append(f"{rename[name]} = sigma - {{{members}}}")
+        else:
+            lines.append(f"{rename[name]} = {{{members}}}")
+
+    emitter = _EdsEmitter(nonterminal_names, set_names)
+    eds_rules = [(rename[name], _rename_ast(expression, rename))
+                 for name, expression in ordered_rules + rule_terminals]
+    lines.extend(emitter.stringify_rules(eds_rules))
+    return "\n".join(lines) + "\n"
 
 
 def convert_to_eds(source: str, language: str) -> str:
@@ -4931,9 +5691,9 @@ class LanguageFrontendTests(unittest.TestCase):
         self.assertIn("struct g", cpp)
         self.assertIn("ctll::set<", cpp)
 
-    def test_lark_rejects_multi_character_lexer_terminal(self):
-        with self.assertRaisesRegex(ValueError, "exactly one character"):
-            lark_to_eds('start: WORD\nWORD: "word"\n')
+    def test_lark_accepts_multi_character_lexer_terminal(self):
+        cpp = _generate_cpp('start: WORD\nWORD: "word"\n', language="lark")
+        self.assertIn("struct g", cpp)
 
     def test_lark_official_syntax_features(self):
         cpp = _generate_cpp(
@@ -4944,6 +5704,210 @@ class LanguageFrontendTests(unittest.TestCase):
             language="lark",
         )
         self.assertIn("ctll::set<'a','b'>", cpp)
+
+
+class RegexEngineTests(unittest.TestCase):
+    """Unit coverage for Tablewright's own regex parser."""
+
+    def test_literal_sequence(self):
+        self.assertEqual(parse_regex("ab"),
+                         ("seq", [("charset", frozenset("a"), False),
+                                  ("charset", frozenset("b"), False)]))
+
+    def test_class_ranges_and_singles(self):
+        self.assertEqual(parse_regex("[a-c_]"),
+                         ("charset", frozenset("abc_"), False))
+
+    def test_negated_class(self):
+        self.assertEqual(parse_regex(r"[^\"\\]"),
+                         ("charset", frozenset('"\\'), True))
+
+    def test_class_shorthands(self):
+        self.assertEqual(parse_regex(r"\d"),
+                         ("charset", frozenset("0123456789"), False))
+        self.assertEqual(parse_regex(r"\D"),
+                         ("charset", frozenset("0123456789"), True))
+        self.assertEqual(parse_regex(r"[\d_]")[1],
+                         frozenset("0123456789_"))
+
+    def test_dot_excludes_newline(self):
+        self.assertEqual(parse_regex("."), ("charset", frozenset("\n"), True))
+
+    def test_dotall_dot_matches_everything(self):
+        self.assertEqual(parse_regex(".", "s"),
+                         ("alt", [("charset", frozenset("\n"), True),
+                                  ("charset", frozenset("\n"), False)]))
+
+    def test_quantifiers(self):
+        atom = ("charset", frozenset("a"), False)
+        self.assertEqual(parse_regex("a+"), ("quant", atom, "+"))
+        self.assertEqual(parse_regex("a*?"), ("quant", atom, "*"))
+        self.assertEqual(parse_regex("a?"), ("quant", atom, "?"))
+
+    def test_counted_repetition(self):
+        atom = ("charset", frozenset("a"), False)
+        self.assertEqual(parse_regex("a{3}"), ("seq", [atom, atom, atom]))
+        self.assertEqual(parse_regex("a{2,}"),
+                         ("seq", [atom, atom, ("quant", atom, "*")]))
+        self.assertEqual(parse_regex("a{1,2}"),
+                         ("seq", [atom, ("quant", atom, "?")]))
+
+    def test_literal_brace_without_count(self):
+        self.assertEqual(parse_regex("a{x")[1][1],
+                         ("charset", frozenset("{"), False))
+
+    def test_groups_and_alternation(self):
+        self.assertEqual(parse_regex("(ab|c)d")[1][0][0], "alt")
+        self.assertEqual(parse_regex("(?:ab)"), parse_regex("(ab)"))
+        self.assertEqual(parse_regex("(?P<x>a)"), parse_regex("a"))
+
+    def test_case_insensitive_flag(self):
+        self.assertEqual(parse_regex("a", "i"),
+                         ("charset", frozenset("aA"), False))
+        self.assertEqual(parse_regex("[a-b]", "i")[1], frozenset("abAB"))
+
+    def test_verbose_flag_strips_layout(self):
+        self.assertEqual(parse_regex("a b # comment\n c", "x"),
+                         parse_regex("abc"))
+
+    def test_hex_and_control_escapes(self):
+        self.assertEqual(parse_regex(r"\x41"), ("charset", frozenset("A"), False))
+        self.assertEqual(parse_regex(r"A"), ("charset", frozenset("A"), False))
+        self.assertEqual(parse_regex(r"\n"), ("charset", frozenset("\n"), False))
+        self.assertEqual(parse_regex(r"\."), ("charset", frozenset("."), False))
+
+    def test_untranslatable_constructs_are_rejected(self):
+        for pattern in ("^a", "a$", r"a\b", r"\Aa", r"(a)\1", "(?=a)b",
+                        "(?!a)b", "(?<=a)b", "a*+", "a**", "(a", "a)",
+                        r"a\x4", "[a", "[]", r"a\\" [:-1]):
+            with self.assertRaises(RegexSyntaxError, msg=pattern):
+                parse_regex(pattern)
+
+    def test_negated_shorthand_inside_class_is_rejected(self):
+        with self.assertRaisesRegex(RegexSyntaxError, "negated shorthand"):
+            parse_regex(r"[a\D]")
+
+
+class LarkRegexLoweringTests(unittest.TestCase):
+    """Lark terminals with real regexes, lowered through EDS."""
+
+    def test_multicharacter_regex_terminal(self):
+        eds = lark_to_eds("start: WORD\nWORD: /[a-z]+/\n")
+        self.assertIn("WORD -> [[a-z]]+", eds)
+        cpp = _generate_cpp("start: WORD\nWORD: /[a-z]+/\n", language="lark")
+        self.assertIn("struct g", cpp)
+
+    def test_single_character_terminal_stays_a_set(self):
+        eds = lark_to_eds("start: DIGIT\nDIGIT: /[0-9]/\n")
+        self.assertIn("DIGIT = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}", eds)
+
+    def test_negated_class_terminal_becomes_negative_set(self):
+        eds = lark_to_eds('start: CH\nCH: /[^"\\\\]/\n')
+        self.assertIn("CH = sigma - {\\\", \\\\}", eds)
+
+    def test_terminal_referencing_terminal(self):
+        eds = lark_to_eds("start: INT\nINT: DIGIT+\nDIGIT: /[0-9]/\n")
+        self.assertIn("INT -> DIGIT+", eds)
+        cpp = _generate_cpp("start: INT\nINT: DIGIT+\nDIGIT: /[0-9]/\n",
+                            language="lark")
+        self.assertIn("struct g", cpp)
+
+    def test_string_terminal_becomes_a_rule(self):
+        eds = lark_to_eds('start: ARROW\nARROW: "->"\n')
+        self.assertIn('ARROW -> "->"', eds)
+
+    def test_case_insensitive_string(self):
+        eds = lark_to_eds('start: KW\nKW: "if"i\n')
+        self.assertIn("KW -> [[Ii]], [[Ff]]", eds)
+
+    def test_regex_with_structure(self):
+        source = "start: NUM\nNUM: /[0-9]+(\\.[0-9]+)?/\n"
+        eds = lark_to_eds(source)
+        self.assertIn("[[0-9]]+", eds)
+        cpp = _generate_cpp(source, language="lark")
+        self.assertIn("struct g", cpp)
+
+    def test_counted_repetition_terminal(self):
+        eds = lark_to_eds("start: HEX2\nHEX2: /[0-9a-f]{2}/\n")
+        self.assertEqual(eds.count("[[0-9a-f]]"), 2)
+
+    def test_regex_directly_in_a_rule(self):
+        cpp = _generate_cpp("start: /[0-9]/ /[a-z]+/\n", language="lark")
+        self.assertIn("struct g", cpp)
+
+    def test_lark_counted_repetition_in_rule(self):
+        eds = lark_to_eds('start: "a" ~ 2..3\n')
+        self.assertIn('a, a, <tw_optional_1>', eds)
+
+    def test_unusable_names_are_prefixed(self):
+        eds = lark_to_eds("a: X\nX: \"x\"\n")
+        self.assertIn("tw_a -> tw_X", eds)
+        self.assertIn("tw_X = {x}", eds)
+
+    def test_reserved_name_is_prefixed(self):
+        eds = lark_to_eds('start: other\nother: "o"\n')
+        self.assertIn("<tw_other>", eds)
+
+    def test_undefined_reference_is_reported(self):
+        with self.assertRaisesRegex(ValueError, "undefined names: missing"):
+            lark_to_eds("start: missing\n")
+
+    def test_declared_terminal_use_is_reported(self):
+        with self.assertRaisesRegex(ValueError, "no definition to translate"):
+            lark_to_eds("%declare EXT\nstart: EXT\n")
+
+    def test_ignore_warns(self):
+        with self.assertLogs(logger, level="WARNING") as captured:
+            lark_to_eds('%import common.WS\n%ignore WS\nstart: "a"\nWS: / /\n')
+        self.assertTrue(any("%ignore" in line for line in captured.output))
+
+    def test_anchor_in_terminal_is_rejected(self):
+        with self.assertRaises(RegexSyntaxError):
+            lark_to_eds("start: BAD\nBAD: /^a/\n")
+
+    def test_emitted_eds_round_trips(self):
+        source = ("start: item (\",\" item)*\n"
+                  "item: WORD | NUM\n"
+                  "WORD: /[a-z]+/\n"
+                  "NUM: /[0-9]+(\\.[0-9]+)?/\n")
+        eds = lark_to_eds(source)
+        table = _build_identifier_table(eds)
+        direct = stringify_grammar(table[SymbolType.non_terminal])
+        table = _build_identifier_table(source, language="lark")
+        via_lark = stringify_grammar(table[SymbolType.non_terminal])
+        self.assertEqual(direct, via_lark)
+
+
+class EmitEdsTests(unittest.TestCase):
+    """The --emit-eds option: write the normalized EDS intermediate."""
+
+    def test_emit_eds_writes_the_intermediate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            grammar = Path(tmp) / "toy.lark"
+            grammar.write_text("start: WORD\nWORD: /[a-z]+/\n",
+                               encoding="utf-8")
+            eds_path = Path(tmp) / "toy.gram"
+            status = main(["--input", str(grammar), "--lang", "lark",
+                           "--emit-eds", str(eds_path), "--check", "-q"])
+            self.assertEqual(status, 0)
+            written = eds_path.read_text(encoding="utf-8")
+            self.assertIn("WORD -> [[a-z]]+", written)
+            self.assertIn("# ", written)  # provenance header
+            # the emitted file is itself a valid EDS grammar
+            self.assertIsNotNone(_build_identifier_table(written))
+
+    def test_emit_eds_passthrough_for_native_input(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            grammar = Path(tmp) / "toy.gram"
+            grammar.write_text("St -> a, b\n", encoding="utf-8")
+            eds_path = Path(tmp) / "out.gram"
+            status = main(["--input", str(grammar), "--emit-eds",
+                           str(eds_path), "--check", "-q"])
+            self.assertEqual(status, 0)
+            self.assertIn("St -> a, b",
+                          eds_path.read_text(encoding="utf-8"))
 
 
 # A small JSON-like grammar reused by the optimization tests.
@@ -4970,7 +5934,8 @@ def build_test_suite() -> "unittest.TestSuite":
                  RangeExpansionTests, HexEscapeTests, SetDefinitionSyntaxTests,
                  RuleOperatorSyntaxTests, QuantifierGroupTests,
                  RangeLookaheadTests,
-                 QualityOfLifeTests, RegressionTests, LanguageFrontendTests):
+                 QualityOfLifeTests, RegressionTests, LanguageFrontendTests,
+                 RegexEngineTests, LarkRegexLoweringTests, EmitEdsTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     return suite
 
@@ -5272,6 +6237,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Generator to use")
     parser.add_argument("--lang", choices=("eds", "ebnf", "lark"), default="eds",
                         help="Input grammar language (default: eds)")
+    parser.add_argument("--emit-eds", dest="emit_eds", type=str, default=None,
+                        metavar="PATH",
+                        help="Write the normalized EDS intermediate grammar to "
+                             "PATH ('-' for stdout). With --lang=lark/ebnf this "
+                             "is the converted grammar; combine with --check to "
+                             "convert without generating C++")
 
     parser.add_argument("--fname", "--cfg:fname", type=Path, default=None,
                         help="Output filename (default: derived from the input "
@@ -5461,6 +6432,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _write_text(path, text + "\n")
             logger.debug(f"  wrote {path}")
 
+    # Start from a fresh identifier table: main() may be invoked more than
+    # once in one process (the built-in tests, library use).
+    identifier_table[SymbolType.action] = set()
+    identifier_table[SymbolType.non_terminal] = {}
+    identifier_table[SymbolType.terminal] = {
+        "other": GrammerType([], SymbolType.negitive_set)
+    }
+
     with args.input as input_file:
         input_data = input_file.read()
     logger.debug(f"Read {len(input_data)} characters from {args.input.name}")
@@ -5469,6 +6448,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         input_data = convert_to_eds(input_data, args.lang)
     if args.lang != "eds":
         logger.debug("Normalized EDS grammar:\n%s", input_data)
+
+    # --emit-eds: write the (converted) EDS grammar itself, before the
+    # pipeline consumes it, so the intermediate is inspectable even when a
+    # later stage rejects the grammar.
+    if getattr(args, "emit_eds", None):
+        provenance = (f"# Normalized EDS grammar written by Tablewright {VERSION}\n"
+                      f"# from {args.input.name} (--lang={args.lang})\n\n")
+        eds_payload = provenance + input_data.rstrip("\n") + "\n"
+        if args.emit_eds == "-":
+            print(eds_payload, end="")
+        else:
+            _write_text(Path(args.emit_eds), eds_payload)
+            logger.info(f"Wrote EDS intermediate to {args.emit_eds} "
+                        f"({len(eds_payload)} bytes)")
 
     with timed_stage(f"Parsing grammar file {args.input.name}"):
         tree = parse_grammar_text(input_data, args.input.name)

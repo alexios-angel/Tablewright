@@ -85,6 +85,9 @@ syntax remains the default (`eds`):
 ```bash
 tablewright --lang=ebnf --input=grammar.ebnf --output=include/
 tablewright --lang=lark --input=grammar.lark --output=include/
+
+# inspect (or keep) the EDS intermediate; --check skips the C++ output
+tablewright --lang=lark --input=grammar.lark --emit-eds=grammar.gram --check
 ```
 
 The EBNF frontend accepts `name = expression;` rules, quoted literals,
@@ -92,18 +95,35 @@ alternation, grouping, optional expressions (`[...]` or `?`), repetition
 (`{...}`, `*`, and `+`), and `epsilon`/`empty`.
 
 The Lark frontend parses complete grammar documents using the official
-`grammars/lark.lark` specification shipped by the installed Lark package. It
-accepts character-oriented parser rules with quoted literals, grouping,
-alternation, multiline alternatives, aliases, priorities, and `?`/`*`/`+`.
-Uppercase terminals may be a single quoted character or a character-class regex
-such as `DIGIT: /[0-9]/`. `%import`, `%declare`, and `%ignore` declarations are
-parsed as Lark syntax; they do not create a separate runtime lexer because CTLL
-parses characters directly.
+`grammars/lark.lark` specification shipped by the installed Lark package
+(Lark parsing Lark). It accepts parser rules with quoted literals (the
+case-insensitive `"..."i` form included), `".."` literal ranges, grouping,
+alternation, multiline alternatives, aliases, priorities, rule modifiers
+(`?rule`, `!rule`), `?`/`*`/`+` and counted `~ n` / `~ n..m` repetition.
 
-Tablewright intentionally rejects Lark terminals that match multi-character
-tokens (for example `WORD: /[a-z]+/`). Such lexer tokens cannot be translated
-faithfully to CTLL's character-at-a-time grammar without changing tokenization
-semantics; express the repetition in a parser rule instead.
+The whole grammar is lowered to the EDS intermediate (write it out with
+`--emit-eds`) and from there compiled to C++ like any native grammar:
+**lark → EDS → C++**. Terminal *regexes* are translated by Tablewright's
+own regex parser, which understands the language-defining core of the
+Python/Lark regex dialect: literals, `.`, character classes (ranges,
+negation, `\d \w \s`), `\xNN`/`\uNNNN`/`\UNNNNNNNN` escapes, groups
+(plain, `(?:...)`, `(?P<name>...)`), alternation, `? * +` and
+`{n}`/`{n,}`/`{n,m}` repetition, and the `i`, `s` and `x` flags. Constructs
+that select match *positions* rather than characters — anchors, word
+boundaries, lookarounds, backreferences, possessive quantifiers — cannot
+be expressed by a grammar rule and are rejected with a pointed error.
+
+A terminal whose language is one character out of a set (`DIGIT: /[0-9]/`,
+`SIGN: "+" | "-"`) stays a terminal — an EDS set. Any multi-character
+terminal (`WORD: /[a-z]+/`, `ARROW: "->"`, `INT: DIGIT+`) is lowered into
+EDS *rules* and recognized character by character by the grammar itself.
+Mind the semantics: CTLL has no separate lexer, so there is no
+longest-match tokenization — where a real lexer would disambiguate
+overlapping tokens, the grammar must be `(q)LL(1)` at the character level,
+and any conflict surfaces when the parse table is built. `%import` and
+`%declare` are parsed as Lark syntax; `%ignore` cannot be honored (there
+is no token stream to filter) and says so with a warning — weave optional
+whitespace into the rules instead.
 
 ## The `.gram` grammar dialect
 
@@ -201,6 +221,7 @@ Tablewright has a number of tools for understanding what it does with a grammar:
 | `--explain NT`      | Explain a single nonterminal — its productions, FIRST/FOLLOW, parse-table row and emitted rules — and exit without writing output |
 | `--dump-stages DIR` | Write each intermediate grammar stage (original, post-recursion, factored) to text files for inspection  |
 | `--debug-json PATH` | Write machine-readable diagnostics (FIRST, FOLLOW, parse table, terminal aliases, analysis) to a JSON file for tooling or diffing |
+| `--emit-eds PATH`   | Write the normalized EDS intermediate (the `--lang=lark`/`ebnf` conversion result) to a file, or `-` for stdout                  |
 | `--stats`           | Print a per-stage timing summary when finished                                                           |
 
 When a grammar is malformed, Tablewright reports the offending line and column
@@ -213,6 +234,7 @@ raw parser internals.
 | ---------------------- | -------------------------------------------------------------------------------------------------------- |
 | `--input`              | Input grammar file. Use `--input=-` to read from stdin                                                    |
 | `--lang`               | Input syntax: `eds` (default), `ebnf`, or `lark`                                                         |
+| `--emit-eds PATH`      | Write the normalized EDS intermediate grammar to PATH (`-` for stdout); with `--lang=lark`/`ebnf` this is the converted grammar. Combine with `--check` to convert without generating C++ |
 | `--output`             | Output directory, or a file path to write directly. Default directory is the current directory            |
 | `--fname` `--cfg:fname`| Output filename (default: derived from the input filename, e.g. `pcre.gram` → `pcre.hpp`)                 |
 | `--namespace` `--cfg:namespace` | C++ namespace to put the grammar in (default: derived from the input filename)                   |
