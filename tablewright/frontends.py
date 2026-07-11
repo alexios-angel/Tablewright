@@ -37,6 +37,7 @@ _EBNF_LARK_GRAMMAR = r"""
     alternatives: sequence ("|" sequence)*
     sequence: factor (","? factor)* ","? |
     factor: repeated ("-" repeated)?
+          | special
     repeated: (INT "*")? atom QUANT?
     ?atom: NAME                 -> name
          | STRING               -> literal
@@ -46,7 +47,10 @@ _EBNF_LARK_GRAMMAR = r"""
 
     _ASSIGN: "::=" | "=" | ":"
     _TERM: ";" | "."
+    special: SPECIAL
+
     QUANT: "?" | "*" | "+"
+    SPECIAL.2: /\?[A-Za-z_][A-Za-z_0-9]*\?/
     INT: /[0-9]+/
     NAME: /[A-Za-z_][A-Za-z_0-9]*/
     STRING: /"(\\.|[^"\\])*"|'(\\.|[^'\\])*'/
@@ -62,7 +66,8 @@ _W3C_EBNF_GRAMMAR = r"""
     w3c: w3c_rule+
     w3c_rule: NAME _W3CASSIGN alternatives
     alternatives: sequence ("|" sequence)*
-    sequence: w3c_factor*
+    sequence: (w3c_factor | special)*
+    special: SPECIAL
     w3c_factor: w3c_item ("-" w3c_item)*
     w3c_item: w3c_primary QUANT?
     ?w3c_primary: NAME             -> name
@@ -73,6 +78,7 @@ _W3C_EBNF_GRAMMAR = r"""
 
     _W3CASSIGN: "::="
     QUANT: /[?*+]/
+    SPECIAL.2: /\?[A-Za-z_][A-Za-z_0-9]*\?/
     HEXREF: /#x[0-9a-fA-F]{1,6}/
     W3C_CLASS: /\[\^?[^\]]+\]/
     W3C_STRING: /"[^"]*"|'[^']*'/
@@ -171,6 +177,12 @@ class ExternalExpressionTransformer(Transformer):
 
     def ebnf(self, children):
         return list(children)
+
+    def special(self, children):
+        # ISO's "special sequence" -- its official escape hatch for
+        # implementation-defined content -- carries a semantic action:
+        # ?push_pair? becomes EDS [push_pair]
+        return ("action", str(children[0])[1:-1])
 
     # --- ISO factors ------------------------------------------------------ #
 
@@ -346,6 +358,7 @@ name_list: "(" name ("," name)* ")"
 ?expansion: expr*
 
 ?expr: atom [OP | "~" NUMBER [".." NUMBER]]
+     | "@" name -> action
 
 ?atom: "(" expansions ")"
      | "[" expansions "]" -> maybe
@@ -407,6 +420,11 @@ class LarkGrammarTransformer(Transformer):
             raise ValueError(
                 f"Lark repetition ~ {minimum}..{maximum} has max below min")
         return _repeat_node(node, minimum, maximum)
+
+    def action(self, children):
+        # a Tablewright extension to Lark's syntax: @name is a semantic
+        # action, positional in the expansion like EDS's [name]
+        return ("action", children[0][1])
 
     def expansion(self, children):
         return ("seq", list(children))

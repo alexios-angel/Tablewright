@@ -99,14 +99,19 @@ included):
   variants), `,` concatenation, `|` alternation, `[x]` optional, `{x}`
   repetition, `(x)` grouping, `n * x` repetition factors, the `x - y`
   exception, quoted literals, `(* comments *)` and `epsilon`/`empty`;
-  postfix `? * +` remain as extensions.
+  postfix `? * +` remain as extensions. A special sequence written
+  `?name?` (no inner spaces) is a **semantic action**, EDS's `[name]` —
+  ISO's own escape hatch for implementation-defined content, put to work.
 * `--lang=w3c` — the W3C notation used by the XML specification:
   terminator-less `Name ::= expression` rules (parsed with Earley — where
   one rule ends is only decidable from the following `::=`),
   juxtaposition for sequence, character classes `[a-z#xB7]` / `[^...]`,
   `#xNN` code-point references, postfix `? * +`, the `A - B` exception,
   and both `/* */` and `(* *)` comments. W3C strings are literal — the
-  dialect has no escape mechanism; use `#xNN` references.
+  dialect has no escape mechanism; use `#xNN` references. `?name?` (no
+  inner spaces) is a semantic action here too; with a space after a
+  quantifier (`Item? Other`) there is never any confusion between the
+  two readings.
 
 An exception `x - y` is translatable exactly when both operands denote
 character sets — classes, single characters, or references to rules that
@@ -125,7 +130,11 @@ rest of the frontend lowers. The frontend accepts parser rules with quoted
 literals (the case-insensitive `"..."i` form included), `".."` literal
 ranges, grouping, alternation, multiline alternatives, aliases,
 priorities, rule modifiers (`?rule`, `!rule`), `?`/`*`/`+` and counted
-`~ n` / `~ n..m` repetition.
+`~ n` / `~ n..m` repetition. As a Tablewright extension, `@name` anywhere
+in an expansion is a **semantic action** — the counterpart of EDS's
+`[name]`, positional in the rule and pushed to CTLL's stack at that spot
+(`pair: key ":" @push_pair value`). Official Lark tools do not know `@`,
+so keep actions out of grammars you share with them.
 
 The whole grammar is lowered to the EDS intermediate (write it out with
 `--emit-eds`) and from there compiled to C++ like any native grammar:

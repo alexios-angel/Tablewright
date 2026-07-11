@@ -1302,6 +1302,48 @@ class EbnfDialectTests(unittest.TestCase):
             self.assertIn('"hi"', eds_path.read_text(encoding="utf-8"))
 
 
+class SemanticActionTests(unittest.TestCase):
+    """Semantic actions in the external frontends: @name (Lark) and
+    ?name? (both EBNF dialects), lowered to EDS [name]."""
+
+    def test_lark_action_lowered(self):
+        eds = lark_to_eds('start: "a" @push_pair "b"\n')
+        self.assertIn("a, [push_pair], b", eds)
+        cpp = _generate_cpp('start: "a" @push_pair "b"\n', language="lark")
+        self.assertIn("push_pair", cpp)
+
+    def test_lark_action_inside_repeated_group(self):
+        eds = lark_to_eds('start: ("x" @tick)* "y"\n')
+        self.assertIn("x, [tick]", eds)
+
+    def test_lark_action_cannot_be_quantified(self):
+        with self.assertRaises(ValueError):
+            lark_to_eds("start: @act2*\n")
+
+    def test_action_name_rules_are_enforced(self):
+        with self.assertRaisesRegex(ValueError, "two or more"):
+            lark_to_eds('start: "a" @x\n')
+        with self.assertRaisesRegex(ValueError, "not usable"):
+            ebnf_to_eds('start = "a", ?epsilon?;')
+
+    def test_ebnf_special_sequence_is_an_action(self):
+        eds = ebnf_to_eds('start = "a", ?push_pair?, "b";')
+        self.assertIn("a, [push_pair], b", eds)
+        cpp = _generate_cpp('start = "a", ?push_pair?, "b";', language="ebnf")
+        self.assertIn("push_pair", cpp)
+
+    def test_ebnf_postfix_quantifiers_are_unaffected(self):
+        eds = ebnf_to_eds('start = "a"?, "b"?;')
+        self.assertNotIn("[", eds.replace("[[", ""))
+
+    def test_w3c_action_and_quantifiers_disambiguate(self):
+        eds = w3c_to_eds('Doc ::= "a" ?mark_it? "b"')
+        self.assertIn("a, [mark_it], b", eds)
+        eds = w3c_to_eds('Doc ::= Item? Other?\nItem ::= "i"\nOther ::= "o"')
+        self.assertNotIn("[mark", eds)
+        self.assertIn("epsilon", eds)
+
+
 class EmitEdsTests(unittest.TestCase):
     """The --emit-eds option: write the normalized EDS intermediate."""
 
@@ -1407,7 +1449,7 @@ def build_test_suite() -> "unittest.TestSuite":
                  RangeLookaheadTests,
                  QualityOfLifeTests, RegressionTests, LanguageFrontendTests,
                  RegexEngineTests, RegexGrammarTests, LarkRegexLoweringTests,
-                 EbnfDialectTests, EmitEdsTests):
+                 EbnfDialectTests, SemanticActionTests, EmitEdsTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     return suite
 

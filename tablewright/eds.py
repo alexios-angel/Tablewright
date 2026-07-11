@@ -117,6 +117,14 @@ class _EdsEmitter:
             return [f"<{name}>" if name in self.nonterminals else name]
         if kind == "literal":
             return self._emit_literal(node[1])
+        if kind == "action":
+            name = node[1]
+            if not _EDS_NAME_RE.fullmatch(name) or name in _EDS_RESERVED_NAMES:
+                raise ValueError(
+                    f"semantic action name {name!r} is not usable: it needs "
+                    "two or more characters, a leading letter, and must not "
+                    "be a reserved word")
+            return [f"[{name}]"]
         if kind == "text":  # raw characters, no escape decoding
             content = node[1]
             if not content:

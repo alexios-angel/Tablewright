@@ -1,7 +1,7 @@
 """Version and provenance constants."""
 
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 AUTHORS = [
     {"name": "Alexios Angel", "email": "aangeletakis@gmail.com"},
 ]
