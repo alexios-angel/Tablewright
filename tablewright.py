@@ -232,9 +232,9 @@ from typing import Dict, List, Optional, Sequence, Set
 
 # Lark parses the .gram input.
 from lark import Discard, Lark, Token, Transformer, Tree, Visitor
-from lark.exceptions import UnexpectedInput
+from lark.exceptions import UnexpectedInput, VisitError
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 AUTHORS = [
     {"name": "Alexios Angel", "email": "aangeletakis@gmail.com"},
 ]
@@ -832,330 +832,360 @@ def _repeat_node(node, minimum: int, maximum):
     return ("seq", copies)
 
 
-class _RegexParser:
-    """Recursive-descent parser for the supported regex subset."""
+# The largest counted repetition worth expanding into copies. Grammars with
+# genuinely huge counts would explode the rule set; refuse early.
+_MAX_COUNTED_REPEAT = 512
 
-    # The largest counted repetition worth expanding into copies. Grammars
-    # with genuinely huge counts would explode the rule set; refuse early.
-    MAX_COUNTED_REPEAT = 512
 
-    def __init__(self, pattern: str, flags: str = ""):
-        for flag in flags:
-            if flag not in "imsxlu":
-                raise RegexSyntaxError(pattern, 0,
-                                       f"unknown regex flag {flag!r}")
-        if "l" in flags:
-            raise RegexSyntaxError(
-                pattern, 0, "the locale flag /l has no compile-time meaning")
-        self.ignorecase = "i" in flags
-        self.dotall = "s" in flags
-        # 'm' only changes anchors and anchors are rejected anyway; 'u' is
-        # the default text semantics. Both are accepted as no-ops.
-        self.pattern = self._strip_verbose(pattern) if "x" in flags else pattern
-        self.pos = 0
-
-    @staticmethod
-    def _strip_verbose(pattern: str) -> str:
-        """Apply the /x flag: drop unescaped whitespace and # comments."""
-        out = []
-        in_class = False
-        index = 0
-        while index < len(pattern):
-            char = pattern[index]
-            if char == "\\" and index + 1 < len(pattern):
-                out.append(pattern[index:index + 2])
-                index += 2
-                continue
-            if in_class:
-                out.append(char)
-                in_class = char != "]"
-                index += 1
-                continue
-            if char == "[":
-                in_class = True
-                out.append(char)
-                index += 1
-                continue
-            if char == "#":
-                while index < len(pattern) and pattern[index] != "\n":
-                    index += 1
-                continue
-            if char in " \t\n\r\f\v":
-                index += 1
-                continue
+def _strip_verbose(pattern: str) -> str:
+    """Apply the /x flag: drop unescaped whitespace and # comments."""
+    out = []
+    in_class = False
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\" and index + 1 < len(pattern):
+            out.append(pattern[index:index + 2])
+            index += 2
+            continue
+        if in_class:
+            out.append(char)
+            in_class = char != "]"
+            index += 1
+            continue
+        if char == "[":
+            in_class = True
             out.append(char)
             index += 1
-        return "".join(out)
+            continue
+        if char == "#":
+            while index < len(pattern) and pattern[index] != "\n":
+                index += 1
+            continue
+        if char in " \t\n\r\f\v":
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
 
-    def _error(self, message: str, position: int = None) -> RegexSyntaxError:
-        where = self.pos if position is None else position
-        return RegexSyntaxError(self.pattern, where, message)
 
-    def _peek(self):
-        return self.pattern[self.pos] if self.pos < len(self.pattern) else None
+# Tablewright's regex dialect, as a Lark grammar (Lark parsing regexes).
+# This is the counterpart of the derived document grammar below: at the
+# document level a regex stays ONE token -- %ignore must never reach inside
+# a pattern, and token extent is a lexical property -- and the token's body
+# is then parsed with this grammar, where every character is significant
+# (note: no %ignore here, ever).
+#
+# The grammar deliberately PARSES the untranslatable constructs -- anchors,
+# word boundaries, backreferences, lookaround/flag group modifiers,
+# possessive markers -- so the transformer can reject each with a message
+# saying why it cannot become a grammar rule, instead of a bare syntax
+# error. Ambiguities are decided the way Python's re does: a well-formed
+# {n,m} is a quantifier, not three literals (postfix.2); 'a-z' inside a
+# class is a span, not three members (krange.2); a leading '^' negates
+# (negclass.2, write '\^' for the literal).
+_REGEX_LARK_GRAMMAR = r"""
+regexp: alternation
 
-    def parse(self):
-        node = self._alternation()
-        if self.pos != len(self.pattern):
-            raise self._error("unbalanced ')'")
-        return node
+?alternation: sequence (_PIPE sequence)*
 
-    def _alternation(self):
-        branches = [self._sequence()]
-        while self._peek() == "|":
-            self.pos += 1
-            branches.append(self._sequence())
-        return branches[0] if len(branches) == 1 else ("alt", branches)
+sequence: term*
 
-    def _sequence(self):
-        items = []
-        while self._peek() not in (None, "|", ")"):
-            items.append(self._term())
+term: factor postfix?
+
+postfix.2: QUANT MODE?
+         | COUNT MODE?
+
+?factor: group
+       | charclass
+       | dot
+       | anchor
+       | backref
+       | escape
+       | char
+
+group: _LPAR GROUPMOD? alternation _RPAR
+dot: _DOT
+anchor: ANCHOR
+backref: BACKREF
+escape: HEX2 | HEX4 | HEX8 | ESC
+char: CHAR | BRACE
+
+?charclass: negclass | posclass
+negclass.2: _LBRACK _KCARET kbody _RBRACK
+posclass: _LBRACK kbody _RBRACK
+
+kbody: kfirst kitem*
+     | kitem+
+kfirst: KFIRSTBRACKET
+?kitem: krange | katom | kdash
+krange.2: katom _KDASH katom
+kdash: KDASH
+katom: kescape | KCHAR
+kescape: HEX2 | HEX4 | HEX8 | ESC
+
+_PIPE: "|"
+_LPAR: "("
+_RPAR: ")"
+_DOT: "."
+_LBRACK: "["
+_RBRACK: "]"
+_KCARET: "^"
+_KDASH: "-"
+KDASH: "-"
+KFIRSTBRACKET: "]"
+ANCHOR.2: /[\^$]/ | /\\[ABZb]/
+BACKREF.2: /\\[1-9][0-9]*/
+GROUPMOD: /\?(?:[:=!]|<[=!]|P<[A-Za-z_][A-Za-z0-9_]*>|P=[A-Za-z_][A-Za-z0-9_]*|#[^)]*|[a-zA-Z]+(?:-[a-zA-Z]+)?(?=[:)]))/
+QUANT: /[*+?]/
+MODE: /[?+]/
+COUNT.2: /\{[0-9]+(,[0-9]*)?\}/
+HEX2.3: /\\x[0-9a-fA-F]{2}/
+HEX4.3: /\\u[0-9a-fA-F]{4}/
+HEX8.3: /\\U[0-9a-fA-F]{8}/
+ESC: /\\./
+CHAR: /[^\\|()\[*+?.^${]/
+BRACE: "{"
+KCHAR: /[^\]\\\-]/
+"""
+
+_REGEX_PARSER = Lark(_REGEX_LARK_GRAMMAR, start="regexp", parser="earley",
+                     lexer="dynamic", maybe_placeholders=False)
+
+
+class _RegexAstTransformer(Transformer):
+    """Turn the regex grammar's parse tree into the frontend AST.
+
+    Every method mirrors one rule of :data:`_REGEX_LARK_GRAMMAR` and builds
+    the ``("seq" / "alt" / "quant" / "charset")`` node language the EDS
+    emitter consumes -- this is where the ``i`` (fold characters) and ``s``
+    (widen the dot) flags apply, and where the parse-but-untranslatable
+    constructs are rejected with positions taken from their tokens.
+    """
+
+    def __init__(self, pattern: str, ignorecase: bool, dotall: bool):
+        super().__init__()
+        self.pattern_text = pattern
+        self.ignorecase = ignorecase
+        self.dotall = dotall
+
+    def _err(self, token, message: str) -> RegexSyntaxError:
+        position = getattr(token, "start_pos", None) or 0
+        return RegexSyntaxError(self.pattern_text, position, message)
+
+    def _chars(self, chars) -> frozenset:
+        return frozenset(_fold_case(chars) if self.ignorecase else chars)
+
+    # --- leaves ---------------------------------------------------------- #
+
+    def char(self, children):
+        return ("charset", self._chars({str(children[0])}), False)
+
+    def dot(self, _children):
+        if self.dotall:
+            # truly any character: the complement of nothing has no EDS
+            # spelling, so say "anything but newline, or a newline"
+            return ("alt", [("charset", frozenset("\n"), True),
+                            ("charset", frozenset("\n"), False)])
+        return ("charset", frozenset("\n"), True)
+
+    def anchor(self, children):
+        token = children[0]
+        if str(token) == r"\b":
+            raise self._err(token, r"the word boundary \b has no meaning "
+                                   "in a grammar rule")
+        raise self._err(
+            token,
+            f"the anchor '{token}' has no meaning in a grammar rule; remove "
+            "it (grammar symbols already match whole tokens)")
+
+    def backref(self, children):
+        raise self._err(children[0], "backreferences are not regular and "
+                                     "cannot become grammar rules")
+
+    def _decode_escape(self, token, in_class: bool):
+        """Decode one escape token to ``("char", c)`` or ``("set", (chars, neg))``."""
+        text = str(token)
+        if token.type in {"HEX2", "HEX4", "HEX8"}:
+            code_point = int(text[2:], 16)
+            if code_point > 0x10FFFF:
+                raise self._err(token, f"{text} is beyond the last code "
+                                       "point U+10FFFF")
+            return ("char", chr(code_point))
+        escape = text[1]
+        if escape == "d":
+            return ("set", (_REGEX_DIGIT_CHARS, False))
+        if escape == "D":
+            return ("set", (_REGEX_DIGIT_CHARS, True))
+        if escape == "w":
+            return ("set", (_REGEX_WORD_CHARS, False))
+        if escape == "W":
+            return ("set", (_REGEX_WORD_CHARS, True))
+        if escape == "s":
+            return ("set", (_REGEX_SPACE_CHARS, False))
+        if escape == "S":
+            return ("set", (_REGEX_SPACE_CHARS, True))
+        if escape in _REGEX_CONTROL_ESCAPES:
+            return ("char", _REGEX_CONTROL_ESCAPES[escape])
+        if escape == "b":
+            if in_class:
+                return ("char", "\x08")
+            raise self._err(token, r"the word boundary \b has no meaning "
+                                   "in a grammar rule")
+        if escape in "ABZ":
+            raise self._err(token, f"the anchor \\{escape} has no meaning "
+                                   "in a grammar rule")
+        if escape == "N":
+            raise self._err(token, r"named escapes \N{...} are not supported")
+        if escape in "xuU":
+            width = {"x": 2, "u": 4, "U": 8}[escape]
+            raise self._err(token,
+                            f"\\{escape} needs exactly {width} hex digits")
+        if escape.isdigit():
+            raise self._err(token, "backreferences are not regular and "
+                                   "cannot become grammar rules")
+        return ("char", escape)
+
+    def escape(self, children):
+        kind, payload = self._decode_escape(children[0], in_class=False)
+        if kind == "set":
+            chars, negated = payload
+            return ("charset", self._chars(chars), negated)
+        return ("charset", self._chars({payload}), False)
+
+    # --- structure ------------------------------------------------------- #
+
+    def regexp(self, children):
+        return children[0]
+
+    def alternation(self, children):
+        return ("alt", list(children))
+
+    def sequence(self, children):
+        # empty groups -- (?#comments), () -- contribute nothing
+        items = [child for child in children if child != ("seq", [])]
         if len(items) == 1:
             return items[0]
         return ("seq", items)
 
-    def _term(self):
-        node = self._factor()
-        quantified = self._apply_quantifier(node)
-        if quantified is not node and self._peek() in ("*", "+", "?", "{"):
-            # a*+ / a*? was consumed above; a** or a*{2} is either an error
-            # or a possessive form -- both change nothing we could express
-            if self._peek() != "{" or self._counted_repeat_ahead():
-                raise self._error("stacked quantifiers are not supported "
-                                  "(group the inner repetition instead)")
-        return quantified
+    def postfix(self, children):
+        quantifier = children[0]
+        mode = children[1] if len(children) > 1 else None
+        if mode is not None and str(mode) == "+":
+            raise self._err(mode, "possessive quantifiers change the "
+                                  "matched language and are not supported")
+        return ("postfix-op", quantifier)
 
-    def _counted_repeat_ahead(self) -> bool:
-        """Whether the text at ``pos`` is a well-formed ``{n}``/``{n,m}``."""
-        return re.match(r"\{\d+(,\d*)?\}", self.pattern[self.pos:]) is not None
+    def term(self, children):
+        node = children[0]
+        if len(children) == 1:
+            return node
+        quantifier = children[1][1]
+        if quantifier.type == "QUANT":
+            return ("quant", node, str(quantifier))
+        match = re.fullmatch(r"\{(\d+)(?:,(\d*))?\}", str(quantifier))
+        minimum = int(match.group(1))
+        if match.group(2) is None:
+            maximum = minimum
+        elif match.group(2):
+            maximum = int(match.group(2))
+        else:
+            maximum = None
+        if maximum is not None and maximum < minimum:
+            raise self._err(quantifier, "bad repeat interval: max is below min")
+        if max(minimum, maximum or 0) > _MAX_COUNTED_REPEAT:
+            raise self._err(quantifier,
+                            f"counted repetition beyond {_MAX_COUNTED_REPEAT} "
+                            "would explode the grammar")
+        return _repeat_node(node, minimum, maximum)
 
-    def _apply_quantifier(self, node):
-        char = self._peek()
-        if char in ("*", "+", "?"):
-            self.pos += 1
-            self._consume_repeat_mode()
-            return ("quant", node, char)
-        if char == "{" and self._counted_repeat_ahead():
-            start = self.pos
-            match = re.match(r"\{(\d+)(?:,(\d*))?\}", self.pattern[self.pos:])
-            minimum = int(match.group(1))
-            if match.group(2) is None:
-                maximum = minimum
-            else:
-                maximum = int(match.group(2)) if match.group(2) else None
-            if maximum is not None and maximum < minimum:
-                raise self._error("bad repeat interval: max is below min", start)
-            if max(minimum, maximum or 0) > self.MAX_COUNTED_REPEAT:
-                raise self._error(
-                    f"counted repetition beyond {self.MAX_COUNTED_REPEAT} "
-                    "would explode the grammar", start)
-            self.pos += match.end()
-            self._consume_repeat_mode()
-            return _repeat_node(node, minimum, maximum)
-        return node
+    def group(self, children):
+        modifier = None
+        body = children[-1]
+        if len(children) > 1:
+            modifier = children[0]
+        if modifier is None:
+            return body
+        text = str(modifier)
+        if text in {"?=", "?!", "?<=", "?<!"}:
+            raise self._err(modifier, "lookarounds cannot be translated "
+                                      "to a grammar")
+        if text == "?:" or (text.startswith("?P<") and text.endswith(">")):
+            return body
+        if text.startswith("?#"):
+            return ("seq", [])
+        if text.startswith("?P="):
+            raise self._err(modifier, "backreferences are not regular and "
+                                      "cannot become grammar rules")
+        raise self._err(modifier, "unsupported (?...) group (inline flags, "
+                                  "conditionals and lookarounds are not "
+                                  "translatable)")
 
-    def _consume_repeat_mode(self):
-        """Accept a lazy '?' (same language); reject a possessive '+'."""
-        if self._peek() == "?":
-            self.pos += 1
-        elif self._peek() == "+":
-            raise self._error("possessive quantifiers change the matched "
-                              "language and are not supported")
+    # --- character classes ------------------------------------------------ #
+    # katom/kfirst/kdash return (payload, position) pairs so class-level
+    # errors can still point into the pattern after transformation.
 
-    def _factor(self):
-        char = self._peek()
-        if char == "(":
-            return self._group()
-        if char == "[":
-            return self._char_class()
-        if char == ".":
-            self.pos += 1
-            if self.dotall:
-                # truly any character: the complement of nothing has no EDS
-                # spelling, so say "anything but newline, or a newline"
-                return ("alt", [("charset", frozenset("\n"), True),
-                                ("charset", frozenset("\n"), False)])
-            return ("charset", frozenset("\n"), True)
-        if char in "^$":
-            raise self._error(
-                f"the anchor '{char}' has no meaning in a grammar rule; "
-                "remove it (grammar symbols already match whole tokens)")
-        if char in "*+?":
-            raise self._error("nothing for the quantifier to repeat")
-        if char == "\\":
-            return self._escape_node()
-        self.pos += 1
-        return self._char_node(char)
+    def kfirst(self, children):
+        return ("]", children[0].start_pos)
 
-    def _char_node(self, char: str):
-        chars = _fold_case({char}) if self.ignorecase else {char}
-        return ("charset", frozenset(chars), False)
+    def kdash(self, children):
+        return ("-", children[0].start_pos)
 
-    def _group(self):
-        opening = self.pos
-        self.pos += 1  # '('
-        if self._peek() == "?":
-            self.pos += 1
-            marker = self._peek()
-            if marker == ":":
-                self.pos += 1
-            elif marker == "P":
-                self.pos += 1
-                if self._peek() == "<":  # (?P<name>...) is just a group
-                    while self._peek() not in (None, ">"):
-                        self.pos += 1
-                    if self._peek() != ">":
-                        raise self._error("unterminated group name", opening)
-                    self.pos += 1
-                else:  # (?P=name) backreference
-                    raise self._error(
-                        "backreferences are not regular and cannot become "
-                        "grammar rules", opening)
-            elif marker == "#":  # (?#comment)
-                while self._peek() not in (None, ")"):
-                    self.pos += 1
-                if self._peek() != ")":
-                    raise self._error("unterminated (?#...) comment", opening)
-                self.pos += 1
-                return ("seq", [])
-            elif marker in ("=", "!") or (marker == "<" and
-                                          self.pattern[self.pos + 1:self.pos + 2]
-                                          in ("=", "!")):
-                raise self._error(
-                    "lookarounds cannot be translated to a grammar", opening)
-            else:
-                raise self._error(
-                    "unsupported (?...) group (inline flags, conditionals "
-                    "and lookarounds are not translatable)", opening)
-        body = self._alternation()
-        if self._peek() != ")":
-            raise self._error("unbalanced '('", opening)
-        self.pos += 1
-        return body
+    def katom(self, children):
+        child = children[0]
+        if isinstance(child, tuple):  # a kescape result
+            return child
+        return (str(child), child.start_pos)
 
-    def _escape_node(self):
-        kind, payload = self._escape(in_class=False)
+    def kescape(self, children):
+        token = children[0]
+        kind, payload = self._decode_escape(token, in_class=True)
         if kind == "set":
             chars, negated = payload
-            if self.ignorecase:
-                chars = frozenset(_fold_case(chars))
-            return ("charset", frozenset(chars), negated)
-        return self._char_node(payload)
+            if negated:
+                raise self._err(token, "a negated shorthand inside [...] is "
+                                       "not supported; rewrite the class "
+                                       "explicitly")
+            return (frozenset(chars), token.start_pos)
+        return (payload, token.start_pos)
 
-    def _escape(self, in_class: bool):
-        r"""Read one ``\`` escape; return ``("char", c)`` or ``("set", (chars, neg))``."""
-        start = self.pos
-        self.pos += 1  # the backslash
-        char = self._peek()
-        if char is None:
-            raise self._error("dangling backslash", start)
-        self.pos += 1
-        if char == "d":
-            return ("set", (_REGEX_DIGIT_CHARS, False))
-        if char == "D":
-            return ("set", (_REGEX_DIGIT_CHARS, True))
-        if char == "w":
-            return ("set", (_REGEX_WORD_CHARS, False))
-        if char == "W":
-            return ("set", (_REGEX_WORD_CHARS, True))
-        if char == "s":
-            return ("set", (_REGEX_SPACE_CHARS, False))
-        if char == "S":
-            return ("set", (_REGEX_SPACE_CHARS, True))
-        if char in _REGEX_CONTROL_ESCAPES:
-            return ("char", _REGEX_CONTROL_ESCAPES[char])
-        if char == "b":
-            if in_class:
-                return ("char", "\x08")
-            raise self._error(
-                r"the word boundary \b has no meaning in a grammar rule", start)
-        if char in "BAZ":
-            raise self._error(
-                f"the anchor \\{char} has no meaning in a grammar rule", start)
-        if char == "N":
-            raise self._error(r"named escapes \N{...} are not supported", start)
-        if char in "xuU":
-            width = {"x": 2, "u": 4, "U": 8}[char]
-            digits = self.pattern[self.pos:self.pos + width]
-            if len(digits) != width or not all(
-                    d in "0123456789abcdefABCDEF" for d in digits):
-                raise self._error(
-                    f"\\{char} needs exactly {width} hex digits", start)
-            self.pos += width
-            code_point = int(digits, 16)
-            if code_point > 0x10FFFF:
-                raise self._error(
-                    f"\\U{digits} is beyond the last code point U+10FFFF", start)
-            return ("char", chr(code_point))
-        if char.isdigit():
-            raise self._error(
-                "backreferences are not regular and cannot become grammar "
-                "rules", start)
-        return ("char", char)
+    def krange(self, children):
+        (low, low_pos), (high, _) = children
+        if not isinstance(low, str) or not isinstance(high, str):
+            raise self._err_at(low_pos, "a class shorthand cannot bound a range")
+        if ord(low) > ord(high):
+            raise self._err_at(low_pos,
+                               f"range start {low!r} is after end {high!r}")
+        return (frozenset(chr(code) for code in range(ord(low), ord(high) + 1)),
+                low_pos)
 
-    def _char_class(self):
-        opening = self.pos
-        self.pos += 1  # '['
-        negated = False
-        if self._peek() == "^":
-            negated = True
-            self.pos += 1
+    def _err_at(self, position: int, message: str) -> RegexSyntaxError:
+        return RegexSyntaxError(self.pattern_text, position or 0, message)
+
+    def kbody(self, children):
         chars = set()
-        first = True
-        while True:
-            char = self._peek()
-            if char is None:
-                raise self._error("unterminated character class", opening)
-            if char == "]" and not first:
-                self.pos += 1
-                break
-            first = False
-            item = self._class_item(opening)
-            # a '-' between two single characters is a span
-            if (isinstance(item, str) and self._peek() == "-"
-                    and self.pattern[self.pos + 1:self.pos + 2] not in ("", "]")):
-                dash_at = self.pos
-                self.pos += 1
-                end_item = self._class_item(opening)
-                if not isinstance(end_item, str):
-                    raise self._error(
-                        "a class shorthand cannot end a range", dash_at)
-                if ord(item) > ord(end_item):
-                    raise self._error(
-                        f"range start {item!r} is after end {end_item!r}",
-                        dash_at)
-                chars.update(chr(code) for code in
-                             range(ord(item), ord(end_item) + 1))
-            elif isinstance(item, str):
-                chars.add(item)
+        for payload, _ in children:
+            if isinstance(payload, str):
+                chars.add(payload)
             else:
-                chars.update(item)
-        if not chars:
-            raise self._error("empty character class", opening)
-        if self.ignorecase:
-            chars = _fold_case(chars)
-        return ("charset", frozenset(chars), negated)
+                chars.update(payload)
+        return chars
 
-    def _class_item(self, opening: int):
-        """One class element: a character (str) or a shorthand's char set."""
-        char = self._peek()
-        if char == "\\":
-            kind, payload = self._escape(in_class=True)
-            if kind == "set":
-                chars, negated = payload
-                if negated:
-                    raise self._error(
-                        "a negated shorthand inside [...] is not supported; "
-                        "rewrite the class explicitly", opening)
-                return chars
-            return payload
-        self.pos += 1
-        return char
+    def posclass(self, children):
+        return ("charset", self._chars(children[0]), False)
+
+    def negclass(self, children):
+        return ("charset", self._chars(children[0]), True)
 
 
 def parse_regex(pattern: str, flags: str = ""):
     r"""Parse a regular expression into the frontend grammar AST.
+
+    The pattern is parsed with :data:`_REGEX_LARK_GRAMMAR` -- Tablewright's
+    own Lark grammar for the regex dialect -- and the tree is transformed
+    into the same node language every frontend lowers, so a parsed pattern
+    drops straight into the EDS emitter and from there into the C++ table.
 
     The supported subset is the language-defining core of Python/Lark
     regexes: literals, ``.``, character classes (ranges, negation, the
@@ -1178,7 +1208,28 @@ def parse_regex(pattern: str, flags: str = ""):
     Raises:
         RegexSyntaxError: For syntax errors and untranslatable constructs.
     """
-    return _RegexParser(pattern, flags).parse()
+    for flag in flags:
+        if flag not in "imsxlu":
+            raise RegexSyntaxError(pattern, 0, f"unknown regex flag {flag!r}")
+    if "l" in flags:
+        raise RegexSyntaxError(pattern, 0,
+                               "the locale flag /l has no compile-time meaning")
+    text = _strip_verbose(pattern) if "x" in flags else pattern
+    try:
+        tree = _REGEX_PARSER.parse(text)
+    except UnexpectedInput as exc:
+        position = max((getattr(exc, "pos_in_stream", 0) or 0), 0)
+        raise RegexSyntaxError(
+            text, min(position, len(text)),
+            "cannot parse the pattern here (unbalanced or incomplete "
+            "syntax)") from exc
+    try:
+        return _RegexAstTransformer(text, "i" in flags,
+                                    "s" in flags).transform(tree)
+    except VisitError as exc:
+        if isinstance(exc.orig_exc, RegexSyntaxError):
+            raise exc.orig_exc from None
+        raise
 
 
 # ======================================================================== #
@@ -1807,9 +1858,81 @@ def ebnf_to_eds(source: str) -> str:
     return _external_rules_to_eds(rules)
 
 
-_LARK_GRAMMAR_PARSER = Lark.open_from_package(
-    "lark", "grammars/lark.lark", parser="lalr"
-)
+# Tablewright's derived grammar of the Lark language, vendored so the
+# frontend does not depend on the grammar file shipped inside whichever
+# lark package happens to be installed. It is derived from lark's own
+# ``grammars/lark.lark`` (MIT, (c) the lark-parser project) and recognizes
+# the same documents.
+#
+# A regex deliberately stays ONE token (``REGEXP``) at this level: its
+# extent is a lexical property, and the document's ``%ignore`` terminals
+# (inline whitespace, comments) must never apply inside a pattern. The
+# token's body is then parsed structurally with Tablewright's regex
+# grammar, :data:`_REGEX_LARK_GRAMMAR` above -- together the two layers
+# are one derived Lark grammar that includes the regex language.
+_TABLEWRIGHT_LARK_GRAMMAR = r"""
+start: (_item? _NL)* _item?
+
+_item: rule
+     | token
+     | statement
+
+rule: RULE rule_params priority? ":" expansions
+token: TOKEN token_params priority? ":" expansions
+
+rule_params: ["{" RULE ("," RULE)* "}"]
+token_params: ["{" TOKEN ("," TOKEN)* "}"]
+
+priority: "." NUMBER
+
+statement: "%ignore" expansions                    -> ignore
+         | "%import" import_path ["->" name]       -> import
+         | "%import" import_path name_list         -> multi_import
+         | "%override" rule                        -> override_rule
+         | "%declare" name+                        -> declare
+
+!import_path: "."? name ("." name)*
+name_list: "(" name ("," name)* ")"
+
+?expansions: alias (_VBAR alias)*
+
+?alias: expansion ["->" RULE]
+
+?expansion: expr*
+
+?expr: atom [OP | "~" NUMBER [".." NUMBER]]
+
+?atom: "(" expansions ")"
+     | "[" expansions "]" -> maybe
+     | value
+
+?value: STRING ".." STRING -> literal_range
+      | name
+      | (REGEXP | STRING) -> literal
+      | name "{" value ("," value)* "}" -> template_usage
+
+name: RULE
+    | TOKEN
+
+_VBAR: _NL? "|"
+OP: /[+*]|[?](?![a-z])/
+RULE: /!?[_?]?[a-z][_a-z0-9]*/
+TOKEN: /_?[A-Z][_A-Z0-9]*/
+STRING: _STRING "i"?
+REGEXP: /\/(?!\/)(\\\/|\\\\|[^\/])*?\/[imslux]*/
+_NL: /(\r?\n)+\s*/
+
+%import common.ESCAPED_STRING -> _STRING
+%import common.SIGNED_INT -> NUMBER
+%import common.WS_INLINE
+
+COMMENT: /\s*/ "//" /[^\n]/* | /\s*/ "#" /[^\n]/*
+
+%ignore WS_INLINE
+%ignore COMMENT
+"""
+
+_LARK_GRAMMAR_PARSER = Lark(_TABLEWRIGHT_LARK_GRAMMAR, parser="lalr")
 
 
 class LarkGrammarTransformer(Transformer):
@@ -5910,6 +6033,53 @@ class EmitEdsTests(unittest.TestCase):
                           eds_path.read_text(encoding="utf-8"))
 
 
+class RegexGrammarTests(unittest.TestCase):
+    """The grammar-driven regex engine: Lark parsing the regex dialect."""
+
+    def test_the_engine_is_a_lark_grammar(self):
+        self.assertIsInstance(_REGEX_PARSER, Lark)
+        self.assertIn("regexp: alternation", _REGEX_LARK_GRAMMAR)
+
+    def test_the_document_grammar_is_vendored_and_keeps_regexp_lexical(self):
+        self.assertIn("REGEXP", _TABLEWRIGHT_LARK_GRAMMAR)
+        self.assertIsInstance(_LARK_GRAMMAR_PARSER, Lark)
+
+    def test_first_position_bracket_is_literal(self):
+        self.assertEqual(parse_regex("[]]"), ("charset", frozenset("]"), False))
+        self.assertEqual(parse_regex("[^]]"), ("charset", frozenset("]"), True))
+
+    def test_dash_literal_at_the_edges(self):
+        self.assertEqual(parse_regex("[-a]")[1], frozenset("-a"))
+        self.assertEqual(parse_regex("[a-]")[1], frozenset("a-"))
+
+    def test_comment_group_vanishes(self):
+        self.assertEqual(parse_regex("(?#note)ab"), parse_regex("ab"))
+
+    def test_backspace_inside_class_boundary_outside(self):
+        self.assertEqual(parse_regex(r"[\b]")[1], frozenset("\x08"))
+        with self.assertRaisesRegex(RegexSyntaxError, "word boundary"):
+            parse_regex(r"a\b")
+
+    def test_multidigit_backreference_is_rejected(self):
+        with self.assertRaisesRegex(RegexSyntaxError, "backreferences"):
+            parse_regex(r"(a)(b)\12")
+
+    def test_lazy_counted_repetition(self):
+        atom = ("charset", frozenset("a"), False)
+        self.assertEqual(parse_regex("a{1,2}?"),
+                         ("seq", [atom, ("quant", atom, "?")]))
+
+    def test_shorthand_cannot_bound_a_range(self):
+        with self.assertRaisesRegex(RegexSyntaxError, "cannot bound a range"):
+            parse_regex(r"[\d-z]")
+
+    def test_bare_bracket_and_brace_are_literals_outside_classes(self):
+        self.assertEqual(parse_regex("a]")[1][1],
+                         ("charset", frozenset("]"), False))
+        self.assertEqual(parse_regex("a}")[1][1],
+                         ("charset", frozenset("}"), False))
+
+
 # A small JSON-like grammar reused by the optimization tests.
 _SAMPLE_JSON = (
     "uchar=sigma-{\\\",\\\\}\n"
@@ -5935,7 +6105,8 @@ def build_test_suite() -> "unittest.TestSuite":
                  RuleOperatorSyntaxTests, QuantifierGroupTests,
                  RangeLookaheadTests,
                  QualityOfLifeTests, RegressionTests, LanguageFrontendTests,
-                 RegexEngineTests, LarkRegexLoweringTests, EmitEdsTests):
+                 RegexEngineTests, RegexGrammarTests, LarkRegexLoweringTests,
+                 EmitEdsTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     return suite
 

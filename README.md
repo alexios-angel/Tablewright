@@ -94,18 +94,23 @@ The EBNF frontend accepts `name = expression;` rules, quoted literals,
 alternation, grouping, optional expressions (`[...]` or `?`), repetition
 (`{...}`, `*`, and `+`), and `epsilon`/`empty`.
 
-The Lark frontend parses complete grammar documents using the official
-`grammars/lark.lark` specification shipped by the installed Lark package
-(Lark parsing Lark). It accepts parser rules with quoted literals (the
-case-insensitive `"..."i` form included), `".."` literal ranges, grouping,
-alternation, multiline alternatives, aliases, priorities, rule modifiers
-(`?rule`, `!rule`), `?`/`*`/`+` and counted `~ n` / `~ n..m` repetition.
+The Lark frontend parses complete grammar documents with Tablewright's
+own **derived Lark grammar** (Lark parsing Lark): a vendored derivative of
+the official `lark.lark` specification, extended with a second layer that
+spells out the *regex* language as grammar rules. At the document level a
+regex stays one token — its extent is lexical, and `%ignore` must never
+reach inside a pattern — and the token's body is then parsed with the
+regex layer (Earley, every character significant) into the same AST the
+rest of the frontend lowers. The frontend accepts parser rules with quoted
+literals (the case-insensitive `"..."i` form included), `".."` literal
+ranges, grouping, alternation, multiline alternatives, aliases,
+priorities, rule modifiers (`?rule`, `!rule`), `?`/`*`/`+` and counted
+`~ n` / `~ n..m` repetition.
 
 The whole grammar is lowered to the EDS intermediate (write it out with
 `--emit-eds`) and from there compiled to C++ like any native grammar:
-**lark → EDS → C++**. Terminal *regexes* are translated by Tablewright's
-own regex parser, which understands the language-defining core of the
-Python/Lark regex dialect: literals, `.`, character classes (ranges,
+**lark → EDS → C++**. The regex layer understands the language-defining
+core of the Python/Lark regex dialect: literals, `.`, character classes (ranges,
 negation, `\d \w \s`), `\xNN`/`\uNNNN`/`\UNNNNNNNN` escapes, groups
 (plain, `(?:...)`, `(?P<name>...)`), alternation, `? * +` and
 `{n}`/`{n,}`/`{n,m}` repetition, and the `i`, `s` and `x` flags. Constructs
