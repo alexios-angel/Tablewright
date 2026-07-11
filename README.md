@@ -39,11 +39,10 @@ FIRST/FOLLOW and the `(q)LL(1)` parse table, and renders the CTLL header.
 You need Python 3 and the [lark](https://github.com/lark-parser/lark) parser.
 
 ```bash
-sudo apt install python3 python3-pip
-pip3 install lark
 git clone https://github.com/alexios-angel/tablewright.git
 cd tablewright
-chmod +x tablewright
+pip3 install -e .        # installs the `tablewright` (and `desatomat`) command
+# or, without installing: pip3 install lark && python3 -m tablewright ...
 ```
 
 ## Usage
@@ -54,19 +53,19 @@ input filename (`pcre.gram` → namespace `pcre`, guard `PCRE_HPP`, file
 `pcre.hpp`, struct `pcre`):
 
 ```bash
-./tablewright --input=pcre.gram --output=include/
+tablewright --input=pcre.gram --output=include/
 ```
 
 Print the generated header straight to stdout:
 
 ```bash
-./tablewright --input=pcre.gram --output=/dev/stdout -q
+tablewright --input=pcre.gram --output=/dev/stdout -q
 ```
 
 Override any of the derived names and turn on optimization:
 
 ```bash
-./tablewright --input=pcre.gram --output=include/ \
+tablewright --input=pcre.gram --output=include/ \
     --namespace=ctre --guard=CTRE__PCRE__HPP --grammar-name=pcre -O3
 ```
 
@@ -74,7 +73,7 @@ Validate a grammar without writing anything (handy in CI or while iterating);
 it exits nonzero if the grammar is invalid:
 
 ```bash
-./tablewright --check --input=pcre.gram
+tablewright --check --input=pcre.gram
 ```
 
 ### EBNF, W3C EBNF and Lark input
@@ -154,7 +153,7 @@ whitespace into the rules instead.
 ## The `.gram` grammar dialect
 
 A grammar is a sequence of **terminal (set) definitions** and **rules**. Run
-`./tablewright --syntax` for this reference at any time.
+`tablewright --syntax` for this reference at any time.
 
 ### Terminal sets
 
@@ -290,5 +289,21 @@ Tablewright ships with a built-in test suite (using only the Python standard
 library). Run it with:
 
 ```bash
-./tablewright --run-tests
+python3 -m tablewright --run-tests
 ```
+
+The package splits along the pipeline's own seams:
+
+| Module | Contents |
+| ------ | -------- |
+| `frontends.py`    | the Lark, ISO-EBNF and W3C-EBNF readers; `convert_to_eds` |
+| `regex_engine.py` | Tablewright's Lark grammar for the regex dialect and its AST transformer |
+| `eds.py`          | the EDS stringifier: escaping, `[[...]]` ranges, the emitter, name allocation |
+| `gramparse.py`    | the native `.gram` dialect: grammar, parsing, identifier collection, verification |
+| `transforms.py`   | left-recursion elimination, left factoring, the `-O1`..`-O3` passes |
+| `analysis.py`     | FIRST/FOLLOW, the `(q)LL(1)` parse table, reachability and health analysis |
+| `codegen.py`      | rendering the parse table into the CTLL C++ header |
+| `pipeline.py`     | the library-level text-in/header-out entry points |
+| `cli.py`          | argument parsing and the end-to-end `main` |
+| `chartools.py`, `symbols.py`, `logutil.py`, `version.py` | character utilities, core data types, logging, constants |
+| `tests.py`        | the built-in suite (`--run-tests`) |

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tablewright"
-version = "0.4.0"
+version = "0.4.1"
 description = "Open-source implementation of Desatomat and its Extended Desátomatu Syntax."
 requires-python = ">=3.10"
 readme = "README.md"
@@ -28,8 +28,8 @@ Homepage = "https://github.com/alexios-angel/tablewright"
 Issues = "https://github.com/alexios-angel/tablewright/issues"
 
 [project.scripts]
-tablewright = "tablewright:main_cli"
-desatomat = "tablewright:main_cli"
+tablewright = "tablewright.cli:main_cli"
+desatomat = "tablewright.cli:main_cli"
 
 [tool.setuptools]
-py-modules = ["tablewright"]
+packages = ["tablewright"]
