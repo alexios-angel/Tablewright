@@ -1609,20 +1609,44 @@ def parse_grammar_text(source: str, filename: str = "<grammar>"):
         raise ValueError(format_grammar_syntax_error(exc, source, filename)) from exc
 
 
-_EXTERNAL_EXPRESSION_GRAMMAR = r"""
+# Tablewright's EBNF document grammars. Two dialects share one transformer
+# and lower to the same frontend AST as every other frontend:
+#
+#  * ISO/IEC 14977 style (--lang=ebnf): ``name = expression ;`` rules with
+#    ',' concatenation, '|' alternation, '[x]' optional, '{x}' repetition,
+#    '(x)' grouping, 'n * x' repetition factors and the 'x - y' exception.
+#    '::='/':' and a '.' terminator are accepted as common variants, and
+#    the '? * +' postfix quantifiers remain as extensions.
+#
+#  * W3C style (--lang=w3c, the XML-specification notation): terminator-less
+#    ``Name ::= expression`` rules, juxtaposition for sequence, character
+#    classes ``[a-z#xB7]`` / ``[^...]``, ``#xNN`` code-point references,
+#    postfix '? * +' and the 'A - B' exception. Parsed with Earley: without
+#    terminators, where one rule ends and the next begins is only decidable
+#    from the following '::=' -- global context a deterministic parser
+#    cannot see.
+#
+# Exceptions are translatable exactly when both operands denote character
+# sets (classes, single characters, references to rules that reduce to
+# them); the difference is computed at conversion time and anything else is
+# rejected with an explanation, never mistranslated.
+_EBNF_LARK_GRAMMAR = r"""
     ebnf: rule+
-    rule: NAME "=" alternatives ";"
-    expression: alternatives
+    rule: NAME _ASSIGN alternatives _TERM
     alternatives: sequence ("|" sequence)*
     sequence: factor (","? factor)* ","? |
-    factor: atom QUANT?
+    factor: repeated ("-" repeated)?
+    repeated: (INT "*")? atom QUANT?
     ?atom: NAME                 -> name
          | STRING               -> literal
          | "(" alternatives ")" -> group
          | "[" alternatives "]" -> optional
          | "{" alternatives "}" -> repeat
 
+    _ASSIGN: "::=" | "=" | ":"
+    _TERM: ";" | "."
     QUANT: "?" | "*" | "+"
+    INT: /[0-9]+/
     NAME: /[A-Za-z_][A-Za-z_0-9]*/
     STRING: /"(\\.|[^"\\])*"|'(\\.|[^'\\])*'/
     EBNF_COMMENT: /\(\*(.|\n)*?\*\)/
@@ -1631,15 +1655,94 @@ _EXTERNAL_EXPRESSION_GRAMMAR = r"""
     %ignore WS
 """
 
-_EXTERNAL_EXPRESSION_PARSER = Lark(
-    _EXTERNAL_EXPRESSION_GRAMMAR,
-    parser="lalr",
-    start=["ebnf", "expression"],
-)
+_EBNF_PARSER = Lark(_EBNF_LARK_GRAMMAR, parser="lalr", start="ebnf")
+
+_W3C_EBNF_GRAMMAR = r"""
+    w3c: w3c_rule+
+    w3c_rule: NAME _W3CASSIGN alternatives
+    alternatives: sequence ("|" sequence)*
+    sequence: w3c_factor*
+    w3c_factor: w3c_item ("-" w3c_item)*
+    w3c_item: w3c_primary QUANT?
+    ?w3c_primary: NAME             -> name
+                | W3C_STRING       -> w3c_string
+                | W3C_CLASS        -> w3c_class
+                | HEXREF           -> w3c_hexref
+                | "(" alternatives ")" -> group
+
+    _W3CASSIGN: "::="
+    QUANT: /[?*+]/
+    HEXREF: /#x[0-9a-fA-F]{1,6}/
+    W3C_CLASS: /\[\^?[^\]]+\]/
+    W3C_STRING: /"[^"]*"|'[^']*'/
+    NAME: /[A-Za-z_][A-Za-z_0-9]*/
+    W3C_COMMENT: /\/\*(.|\n)*?\*\//
+    EBNF_COMMENT: /\(\*(.|\n)*?\*\)/
+    %ignore W3C_COMMENT
+    %ignore EBNF_COMMENT
+    %import common.WS
+    %ignore WS
+"""
+
+_W3C_EBNF_PARSER = Lark(_W3C_EBNF_GRAMMAR, parser="earley", start="w3c",
+                        maybe_placeholders=False)
+
+
+def _charset_subtract(left, right):
+    """Compute the character-set difference of two charset nodes, or ``None``.
+
+    All four polarity combinations are exact set algebra: ``A - B``,
+    ``!A - B = !(A|B)``, ``A - !B = A&B`` and ``!A - !B = B - A``.
+    """
+    if left is None or right is None:
+        return None
+    _, left_chars, left_negated = left
+    _, right_chars, right_negated = right
+    if not left_negated and not right_negated:
+        return ("charset", frozenset(left_chars - right_chars), False)
+    if left_negated and not right_negated:
+        return ("charset", frozenset(left_chars | right_chars), True)
+    if not left_negated and right_negated:
+        return ("charset", frozenset(left_chars & right_chars), False)
+    return ("charset", frozenset(right_chars - left_chars), False)
+
+
+def _resolve_exceptions(node, env: dict):
+    """Rewrite every EBNF ``("exception", a, b)`` node into a charset.
+
+    ``env`` maps rule names to their expressions so an operand may be a
+    reference to a rule that itself reduces to a character set (the common
+    ``Char - '-'`` idiom of the XML specification).
+
+    Raises:
+        ValueError: When an operand does not denote a character set, or the
+            difference removes every character.
+    """
+    kind = node[0]
+    if kind == "exception":
+        left = _resolve_exceptions(node[1], env)
+        right = _resolve_exceptions(node[2], env)
+        result = _charset_subtract(_reduce_to_charset(left, env, set()),
+                                   _reduce_to_charset(right, env, set()))
+        if result is None:
+            raise ValueError(
+                "the EBNF exception '-' is only translatable when both "
+                "sides denote character sets (classes, single characters, "
+                "or rules that reduce to them)")
+        if not result[2] and not result[1]:
+            raise ValueError("the EBNF exception removes every character")
+        return result
+    if kind in {"seq", "alt"}:
+        return (kind, [_resolve_exceptions(child, env) for child in node[1]])
+    if kind == "quant":
+        return ("quant", _resolve_exceptions(node[1], env), node[2])
+    return node
 
 
 class ExternalExpressionTransformer(Transformer):
-    """Turn Lark's EBNF/expression parse tree into the frontend AST."""
+    """Turn both EBNF dialects' parse trees into the frontend AST."""
+
+    # --- shared shapes ---------------------------------------------------- #
 
     def name(self, children):
         return ("name", str(children[0]))
@@ -1653,10 +1756,6 @@ class ExternalExpressionTransformer(Transformer):
     def alternatives(self, children):
         return ("alt", list(children))
 
-    def factor(self, children):
-        node = children[0]
-        return ("quant", node, str(children[1])) if len(children) == 2 else node
-
     def group(self, children):
         return children[0]
 
@@ -1666,23 +1765,100 @@ class ExternalExpressionTransformer(Transformer):
     def repeat(self, children):
         return ("quant", children[0], "*")
 
-    def expression(self, children):
-        return children[0]
-
     def rule(self, children):
         return (str(children[0]), children[1])
 
     def ebnf(self, children):
         return list(children)
 
+    # --- ISO factors ------------------------------------------------------ #
 
-def _parse_external_expression(source: str):
-    """Parse an EBNF-style expression with Lark and return its frontend AST."""
-    try:
-        tree = _EXTERNAL_EXPRESSION_PARSER.parse(source, start="expression")
-    except UnexpectedInput as exc:
-        raise ValueError(format_grammar_syntax_error(exc, source, "<expression>")) from exc
-    return ExternalExpressionTransformer().transform(tree)
+    def repeated(self, children):
+        count = None
+        quantifier = None
+        node = None
+        for child in children:
+            if isinstance(child, Token) and child.type == "INT":
+                count = int(child)
+            elif isinstance(child, Token) and child.type == "QUANT":
+                quantifier = str(child)
+            else:
+                node = child
+        if quantifier is not None:
+            node = ("quant", node, quantifier)
+        if count is not None:
+            node = _repeat_node(node, count, count)
+        return node
+
+    def factor(self, children):
+        if len(children) == 1:
+            return children[0]
+        return ("exception", children[0], children[1])
+
+    # --- W3C forms ---------------------------------------------------------- #
+
+    def w3c_string(self, children):
+        # W3C strings have no escape mechanism; the body is literal text
+        return ("text", str(children[0])[1:-1])
+
+    def w3c_hexref(self, children):
+        return ("charset", frozenset({_w3c_code_point(str(children[0]))}), False)
+
+    def w3c_class(self, children):
+        token = str(children[0])
+        body = token[1:-1]
+        negated = body.startswith("^")
+        if negated:
+            body = body[1:]
+        if not body:
+            raise ValueError(f"empty character class {token}")
+
+        def read_point(index):
+            if body.startswith("#x", index):
+                match = re.match(r"#x[0-9a-fA-F]{1,6}", body[index:])
+                if match:
+                    return _w3c_code_point(match.group()), index + match.end()
+            return body[index], index + 1
+
+        chars = set()
+        index = 0
+        while index < len(body):
+            low, index = read_point(index)
+            if index < len(body) - 1 and body[index] == "-":
+                high, index = read_point(index + 1)
+                if ord(low) > ord(high):
+                    raise ValueError(f"range {low!r}-{high!r} in {token} is "
+                                     "reversed")
+                chars.update(chr(code) for code in range(ord(low), ord(high) + 1))
+            else:
+                chars.add(low)
+        return ("charset", frozenset(chars), negated)
+
+    def w3c_item(self, children):
+        node = children[0]
+        if len(children) == 2:
+            return ("quant", node, str(children[1]))
+        return node
+
+    def w3c_factor(self, children):
+        node = children[0]
+        for right in children[1:]:
+            node = ("exception", node, right)
+        return node
+
+    def w3c_rule(self, children):
+        return (str(children[0]), children[1])
+
+    def w3c(self, children):
+        return list(children)
+
+
+def _w3c_code_point(reference: str) -> str:
+    """Decode a W3C ``#xNN`` code-point reference to its character."""
+    code_point = int(reference[2:], 16)
+    if code_point > 0x10FFFF:
+        raise ValueError(f"{reference} is beyond the last code point U+10FFFF")
+    return chr(code_point)
 
 
 def _decode_quoted_literal(token: str) -> "tuple[str, bool]":
@@ -1781,6 +1957,13 @@ class _EdsEmitter:
             return [f"<{name}>" if name in self.nonterminals else name]
         if kind == "literal":
             return self._emit_literal(node[1])
+        if kind == "text":  # raw characters, no escape decoding
+            content = node[1]
+            if not content:
+                return ["epsilon"]
+            if len(content) == 1:
+                return [_eds_escape_char(content)]
+            return [_eds_string(content)]
         if kind == "literal_range":
             low, _ = _decode_quoted_literal(node[1])
             high, _ = _decode_quoted_literal(node[2])
@@ -1842,20 +2025,44 @@ class _EdsEmitter:
 
 def _external_rules_to_eds(rules: "list[tuple[str, object]]") -> str:
     """Lower parsed external grammar expressions into the native EDS syntax."""
-    emitter = _EdsEmitter(nonterminals={name for name, _ in rules})
-    return "\n".join(emitter.stringify_rules(rules)) + "\n"
+    env = {name: node for name, node in rules}
+    rules = [(name, _resolve_exceptions(node, env)) for name, node in rules]
+    rename = _allocate_eds_names([name for name, _ in rules])
+    emitter = _EdsEmitter(nonterminals={rename[name] for name, _ in rules})
+    renamed = [(rename[name], _rename_ast(node, rename))
+               for name, node in rules]
+    return "\n".join(emitter.stringify_rules(renamed)) + "\n"
+
+
+def _external_document_to_eds(source: str, parser, filename: str,
+                              empty_message: str) -> str:
+    """Parse one EBNF dialect and lower its rules to EDS."""
+    try:
+        tree = parser.parse(source)
+    except UnexpectedInput as exc:
+        raise ValueError(
+            format_grammar_syntax_error(exc, source, filename)) from exc
+    try:
+        rules = ExternalExpressionTransformer().transform(tree)
+    except VisitError as exc:
+        if isinstance(exc.orig_exc, ValueError):
+            raise exc.orig_exc from None
+        raise
+    if not rules:
+        raise ValueError(empty_message)
+    return _external_rules_to_eds(rules)
 
 
 def ebnf_to_eds(source: str) -> str:
-    """Convert character-oriented ISO EBNF into Tablewright's native syntax."""
-    try:
-        tree = _EXTERNAL_EXPRESSION_PARSER.parse(source, start="ebnf")
-    except UnexpectedInput as exc:
-        raise ValueError(format_grammar_syntax_error(exc, source, "<ebnf>")) from exc
-    rules = ExternalExpressionTransformer().transform(tree)
-    if not rules:
-        raise ValueError("EBNF grammar contains no rules")
-    return _external_rules_to_eds(rules)
+    """Convert ISO 14977-style EBNF into Tablewright's native syntax."""
+    return _external_document_to_eds(source, _EBNF_PARSER, "<ebnf>",
+                                     "EBNF grammar contains no rules")
+
+
+def w3c_to_eds(source: str) -> str:
+    """Convert W3C (XML-specification) EBNF into Tablewright's native syntax."""
+    return _external_document_to_eds(source, _W3C_EBNF_PARSER, "<w3c-ebnf>",
+                                     "W3C EBNF grammar contains no rules")
 
 
 # Tablewright's derived grammar of the Lark language, vendored so the
@@ -2057,6 +2264,14 @@ def _reduce_to_charset(node, terminal_asts: dict, visiting: set):
             return None
         chars = _fold_case({text}) if insensitive else {text}
         return ("charset", frozenset(chars), False)
+    if kind == "text":
+        if len(node[1]) != 1:
+            return None
+        return ("charset", frozenset(node[1]), False)
+    if kind == "exception":
+        return _charset_subtract(
+            _reduce_to_charset(node[1], terminal_asts, visiting),
+            _reduce_to_charset(node[2], terminal_asts, visiting))
     if kind == "literal_range":
         low, _ = _decode_quoted_literal(node[1])
         high, _ = _decode_quoted_literal(node[2])
@@ -2238,7 +2453,8 @@ def lark_to_eds(source: str) -> str:
 
 def convert_to_eds(source: str, language: str) -> str:
     """Normalize a supported input language to the native EDS frontend."""
-    converters = {"eds": lambda text: text, "ebnf": ebnf_to_eds, "lark": lark_to_eds}
+    converters = {"eds": lambda text: text, "ebnf": ebnf_to_eds,
+                  "lark": lark_to_eds, "w3c": w3c_to_eds}
     return converters[language](source)
 
 
@@ -6001,6 +6217,78 @@ class LarkRegexLoweringTests(unittest.TestCase):
         self.assertEqual(direct, via_lark)
 
 
+class EbnfDialectTests(unittest.TestCase):
+    """The upgraded ISO frontend and the W3C (XML-spec) EBNF dialect."""
+
+    def test_iso_repetition_factor(self):
+        eds = ebnf_to_eds('start = 3 * "a";')
+        self.assertIn("a, a, a", eds)
+        cpp = _generate_cpp('start = 3 * "ab";', language="ebnf")
+        self.assertIn("struct g", cpp)
+
+    def test_iso_assign_and_terminator_variants(self):
+        cpp = _generate_cpp('start ::= "x" .', language="ebnf")
+        self.assertIn("ctll::term<'x'>", cpp)
+
+    def test_iso_exception_of_character_sets(self):
+        eds = ebnf_to_eds('start = ("a" | "b" | "c") - "b";')
+        self.assertIn("[[ac]]", eds)
+
+    def test_iso_exception_via_rule_reference(self):
+        eds = ebnf_to_eds('start = char - "b";\nchar = "a" | "b";')
+        self.assertIn("start -> a", eds)
+
+    def test_iso_untranslatable_exception_is_reported(self):
+        with self.assertRaisesRegex(ValueError, "only translatable"):
+            ebnf_to_eds('start = foo - "b";\nfoo = "a", "x";')
+
+    def test_iso_exception_removing_everything_is_reported(self):
+        with self.assertRaisesRegex(ValueError, "removes every character"):
+            ebnf_to_eds('start = "a" - "a";')
+
+    def test_w3c_generates_cpp(self):
+        source = ("Name ::= NameStart NameChar*\n"
+                  "NameStart ::= [A-Z_a-z]\n"
+                  "NameChar ::= NameStart | [-.0-9]\n")
+        eds = w3c_to_eds(source)
+        self.assertIn("[[A-Z_a-z]]", eds)
+        self.assertIn("[[\\-.0-9]]", eds)
+        cpp = _generate_cpp(source, language="w3c")
+        self.assertIn("struct g", cpp)
+
+    def test_w3c_hexrefs_and_single_char_names(self):
+        eds = w3c_to_eds("S ::= [#x20#x9#xD#xA]+")
+        self.assertIn("tw_S", eds)  # 'S' is too short for an EDS name
+        self.assertIn(r"\t\n\r\x20", eds)
+
+    def test_w3c_negated_class(self):
+        eds = w3c_to_eds("Val ::= '\"' [^\"]* '\"'")
+        self.assertIn('[[^"]]*', eds)
+
+    def test_w3c_exception_like_the_xml_spec(self):
+        eds = w3c_to_eds('Cmt ::= Chr - "-"\nChr ::= [a-z-]\n')
+        self.assertIn("Cmt -> [[a-z]]", eds)
+
+    def test_w3c_multicharacter_string(self):
+        eds = w3c_to_eds('Doc ::= "<?xml"')
+        self.assertIn('"<?xml"', eds)
+
+    def test_w3c_comments_both_styles(self):
+        eds = w3c_to_eds("/* c1 */ Doc ::= 'x' (* c2 *)\n")
+        self.assertIn("Doc -> x", eds)
+
+    def test_w3c_through_the_cli(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            grammar = Path(tmp) / "toy.w3c"
+            grammar.write_text('Greeting ::= "hi" [0-9]*\n', encoding="utf-8")
+            eds_path = Path(tmp) / "toy.gram"
+            status = main(["--input", str(grammar), "--lang", "w3c",
+                           "--emit-eds", str(eds_path), "--check", "-q"])
+            self.assertEqual(status, 0)
+            self.assertIn('"hi"', eds_path.read_text(encoding="utf-8"))
+
+
 class EmitEdsTests(unittest.TestCase):
     """The --emit-eds option: write the normalized EDS intermediate."""
 
@@ -6106,7 +6394,7 @@ def build_test_suite() -> "unittest.TestSuite":
                  RangeLookaheadTests,
                  QualityOfLifeTests, RegressionTests, LanguageFrontendTests,
                  RegexEngineTests, RegexGrammarTests, LarkRegexLoweringTests,
-                 EmitEdsTests):
+                 EbnfDialectTests, EmitEdsTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     return suite
 
@@ -6406,8 +6694,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Output directory, or a file path to write directly")
     parser.add_argument("--generator", type=str, default="cpp_ctll_v2",
                         help="Generator to use")
-    parser.add_argument("--lang", choices=("eds", "ebnf", "lark"), default="eds",
-                        help="Input grammar language (default: eds)")
+    parser.add_argument("--lang", choices=("eds", "ebnf", "lark", "w3c"),
+                        default="eds",
+                        help="Input grammar language (default: eds); w3c is "
+                             "the XML-specification EBNF notation")
     parser.add_argument("--emit-eds", dest="emit_eds", type=str, default=None,
                         metavar="PATH",
                         help="Write the normalized EDS intermediate grammar to "
